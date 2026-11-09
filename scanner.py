@@ -24,9 +24,9 @@ from datetime import datetime, timezone
 
 import requests
 
-GAMMA_URL = "https://gamma-api.polymarket.com/events"
+GAMMA_URL = "https://gamma-api.polymarket.com/events/keyset"
 PAGE_SIZE = 100
-MAX_PAGES = 200  # Sicherheitsgrenze gegen Endlosschleifen
+MAX_PAGES = 500  # Sicherheitsgrenze gegen Endlosschleifen
 
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000"))
 MAX_VOLUME = float(os.getenv("MAX_VOLUME", "200000"))
@@ -55,10 +55,12 @@ def parse_list(value):
 
 
 def fetch_open_events():
-    """Lädt alle offenen Events seitenweise."""
+    """Lädt alle offenen Events über die Cursor-Schnittstelle (/events/keyset).
+    Polymarket filtert schon serverseitig grob nach Volumen (mit etwas Spielraum),
+    die exakte Prüfung über alle Antwortmöglichkeiten passiert danach lokal."""
     session = requests.Session()
     session.headers["User-Agent"] = "polymarket-scanner/1.0"
-    events, offset = [], 0
+    events, cursor = [], None
 
     for _ in range(MAX_PAGES):
         params = {
@@ -66,12 +68,17 @@ def fetch_open_events():
             "closed": "false",
             "archived": "false",
             "limit": PAGE_SIZE,
-            "offset": offset,
+            "volume_min": int(MIN_VOLUME * 0.8),
+            "volume_max": int(MAX_VOLUME * 1.2),
         }
+        if cursor:
+            params["after_cursor"] = cursor
+
+        resp = None
         for attempt in range(4):
             try:
                 resp = session.get(GAMMA_URL, params=params, timeout=30)
-                if resp.status_code == 429:
+                if resp.status_code == 429 or resp.status_code >= 500:
                     time.sleep(2 ** attempt)
                     continue
                 resp.raise_for_status()
@@ -83,18 +90,16 @@ def fetch_open_events():
                 time.sleep(2 ** attempt)
 
         data = resp.json()
-        # Kompatibel mit Listen-Antwort und {"data": [...]}-Antwort
-        page = data.get("data", []) if isinstance(data, dict) else data
+        page = data.get("events", []) if isinstance(data, dict) else data
         if not page:
             break
         events.extend(page)
-        # Die API liefert evtl. weniger als PAGE_SIZE pro Seite (z. B. max. 100),
-        # daher erst aufhören, wenn eine Seite leer ist
-        offset += len(page)
-        time.sleep(0.2)
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not cursor:
+            break
+        time.sleep(0.1)
 
     return events
-
 
 def event_total_volume(event):
     """Gesamtvolumen = Summe aller Märkte (Antwortmöglichkeiten) des Events."""
