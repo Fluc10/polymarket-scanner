@@ -2,19 +2,26 @@
 Facticity / ArAIstotle-Anbindung – gezielte Checks für die Märkte aus dem Scan
 -----------------------------------------------------------------------------
 Ablauf:
-  1) Aus dem Scan werden die Märkte ausgewählt (pro Event die Favoriten-Antwort).
+  1) Aus dem Scan werden Märkte ausgewählt (pro Event die Favoriten-Antwort,
+     ohne Extrempreise unter 3 % / über 97 %).
   2) Feed (GET /polymarket/araistotle-insights/, 1 Credit): was dort schon
      analysiert ist, wird direkt übernommen.
   3) Für die restlichen Märkte gezielt POST /araistotle-insight/:
        vorhandene Analyse = 2 Credits, neue Analyse = 10 Credits,
        Status-Abfrage = kostenlos.
+     Neue Analysen dauern oft länger, als Facticitys Server auf eine Antwort
+     wartet (Fehler 504). Die Analyse läuft dann trotzdem weiter – das Skript
+     wartet und holt sie ab, sobald sie fertig ist.
 
 Umgebungsvariablen:
   FACTICITY_API_KEY      (Secret, Pflicht)
   MAX_INSIGHTS           (Default 20)  – max. Märkte pro Lauf
   MAX_NEW_GENERATIONS    (Default 5)   – max. neue Analysen à 10 Credits pro Lauf
   ANALYZE_MODE           (Default "top") – "top" = Favorit pro Event, "all" = alle Antworten
-  WAIT_MINUTES           (Default 10)  – wie lange auf neue Analysen gewartet wird
+  SELECT_ORDER           (Default "niche") – "niche" = kleinste Events zuerst,
+                                             "top" = größte zuerst, "random" = Zufall
+  PRICE_MIN / PRICE_MAX  (Default 0.03 / 0.97) – Extrempreise überspringen
+  WAIT_MINUTES           (Default 15)  – wie lange auf neue Analysen gewartet wird
   USE_FEED               (Default "true") – Feed vorher nutzen, um Credits zu sparen
 """
 
@@ -30,9 +37,13 @@ API_KEY = os.getenv("FACTICITY_API_KEY", "").strip()
 MAX_INSIGHTS = int(os.getenv("MAX_INSIGHTS") or "20")
 MAX_NEW_GENERATIONS = int(os.getenv("MAX_NEW_GENERATIONS") or "5")
 ANALYZE_MODE = (os.getenv("ANALYZE_MODE") or "top").lower()
-WAIT_MINUTES = float(os.getenv("WAIT_MINUTES") or "10")
+SELECT_ORDER = (os.getenv("SELECT_ORDER") or "niche").lower()
+PRICE_MIN = float(os.getenv("PRICE_MIN") or "0.03")
+PRICE_MAX = float(os.getenv("PRICE_MAX") or "0.97")
+WAIT_MINUTES = float(os.getenv("WAIT_MINUTES") or "15")
 USE_FEED = (os.getenv("USE_FEED") or "true").lower() == "true"
 POLL_SECONDS = 30
+QUEUED = "QUEUED"  # Marker: Analyse wurde angestoßen, ist aber noch nicht fertig
 
 
 def _f(value):
@@ -107,8 +118,12 @@ def select_markets(events, in_range):
     for ev in events:
         if not in_range(ev):
             continue
-        open_markets = [m for m in (ev.get("markets") or [])
-                        if not m.get("closed") and m.get("id") is not None]
+        open_markets = []
+        for m in ev.get("markets") or []:
+            p = market_yes_price(m)
+            if (not m.get("closed") and m.get("id") is not None
+                    and p is not None and PRICE_MIN <= p <= PRICE_MAX):
+                open_markets.append(m)
         if not open_markets:
             continue
         chosen = (open_markets if ANALYZE_MODE == "all"
@@ -123,7 +138,13 @@ def select_markets(events, in_range):
                                     for x in ev.get("markets") or []),
                 "url": f"https://polymarket.com/event/{ev.get('slug', '')}",
             })
-    picked.sort(key=lambda r: r["event_volume"], reverse=True)
+    if SELECT_ORDER == "top":        # größtes Volumen zuerst
+        picked.sort(key=lambda r: r["event_volume"], reverse=True)
+    elif SELECT_ORDER == "random":   # jeder Lauf eine andere Stichprobe
+        import random
+        random.shuffle(picked)
+    else:                            # "niche": kleinstes Volumen zuerst
+        picked.sort(key=lambda r: r["event_volume"])
     return picked[:MAX_INSIGHTS]
 
 
@@ -165,27 +186,37 @@ class Facticity:
         return out
 
     def status(self, market_id):
+        """Kostenlos. Gibt {} zurück, wenn die Abfrage hängt oder fehlschlägt."""
         try:
             r = self.s.get(f"{API}/asp/prediction-insight/{market_id}/status",
-                           params={"source": "polymarket"}, timeout=30)
+                           params={"source": "polymarket"}, timeout=15)
             return r.json() if r.ok else {}
         except (requests.RequestException, ValueError):
             return {}
 
     def insight(self, market_id):
-        """Gibt (Antwort, Fehlertext) zurück – bricht nie den Lauf ab."""
+        """Gibt (Antwort, Fehlertext) zurück – bricht nie den Lauf ab.
+        Bei Time-out (502/503/504 oder keine Antwort) läuft die Analyse bei
+        Facticity weiter → Rückgabe (None, QUEUED)."""
         try:
             r = self.s.post(f"{API}/araistotle-insight/",
                             json={"polymarket_market_id": market_id, "refresh": False},
-                            timeout=120)
+                            timeout=90)
+        except requests.Timeout:
+            return None, QUEUED
         except requests.RequestException as e:
             return None, f"Netzwerkfehler: {e}"
+        if r.status_code in (502, 503, 504):
+            return None, QUEUED
         if not r.ok:
-            return None, f"Fehler {r.status_code}: {r.text[:200]}"
+            return None, f"Fehler {r.status_code}: {r.text[:150]}"
         try:
-            return r.json(), ""
+            data = r.json()
         except ValueError:
-            return None, f"Ungültige Antwort: {r.text[:200]}"
+            return None, f"Ungültige Antwort: {r.text[:150]}"
+        if data.get("araistotle_odds") is None and not data.get("ready"):
+            return None, QUEUED  # angenommen, aber noch nicht fertig
+        return data, ""
 
 
 def analyze(events, in_range):
@@ -216,25 +247,30 @@ def analyze(events, in_range):
         if mid in results:
             continue
         st = fc.status(mid)
+        stage = (st.get("status") or "").lower()
         if st.get("ready"):
-            res, err = fc.insight(mid)
+            res, err = fc.insight(mid)            # fertige Analyse holen (2 Credits)
             if res:
                 results[mid] = res
-            c["ai_status"] = err or "vorhanden"
-        elif (st.get("status") or "").lower() == "resolved":
+                c["ai_status"] = "vorhanden"
+            elif err == QUEUED:
+                waiting.append(c)
+            else:
+                c["ai_status"] = err
+        elif stage == "resolved":
             c["ai_status"] = "Markt bereits aufgelöst"
         elif st.get("exists"):
-            waiting.append(c)
+            waiting.append(c)                     # läuft bereits bei Facticity
         elif new_generations < MAX_NEW_GENERATIONS:
-            res, err = fc.insight(mid)
+            res, err = fc.insight(mid)            # neue Analyse anstoßen (10 Credits)
             new_generations += 1
-            if err:
-                c["ai_status"] = err
-            elif res.get("ready") or res.get("araistotle_odds") is not None:
+            if res:
                 results[mid] = res
-                c["ai_status"] = res.get("source") or "neu erzeugt"
-            else:
+                c["ai_status"] = "neu erzeugt"
+            elif err == QUEUED:
                 waiting.append(c)
+            else:
+                c["ai_status"] = err
         else:
             c["ai_status"] = "übersprungen (Limit neue Analysen)"
         time.sleep(0.3)
@@ -250,12 +286,12 @@ def analyze(events, in_range):
                 res, err = fc.insight(c["market_id"])
                 if res:
                     results[c["market_id"]] = res
-                c["ai_status"] = err or "neu erzeugt"
-            else:
-                still.append(c)
+                    c["ai_status"] = "neu erzeugt"
+                    continue
+            still.append(c)
         waiting = still
     for c in waiting:
-        c["ai_status"] = "Analyse läuft noch (nächster Lauf)"
+        c["ai_status"] = "Analyse läuft noch – kommt im nächsten Lauf"
 
     # 4) Ergebnisse
     rows = []
@@ -343,9 +379,11 @@ def summary_message(rows, top_n=10):
     import html as h
     with_edge = [r for r in rows if r["edge"] != ""]
     if not with_edge:
-        errors = {r["ai_status"] for r in rows if r["ai_status"]}
-        return ("🤖 ArAIstotle: noch keine Ergebnisse für deine Märkte.\n"
-                + ("Status: " + h.escape("; ".join(list(errors)[:3])) if errors else ""))
+        pending = sum("läuft noch" in r["ai_status"] for r in rows)
+        msg = "🤖 ArAIstotle: in diesem Lauf noch keine fertigen Ergebnisse."
+        if pending:
+            msg += f"\n⏳ {pending} Analysen laufen noch bei Facticity und kommen im nächsten Lauf."
+        return msg
     lines = ["🤖 <b>ArAIstotle-Check deiner Märkte</b>", ""]
     for r in with_edge[:top_n]:
         lines.append(
@@ -353,5 +391,7 @@ def summary_message(rows, top_n=10):
             f'{h.escape(str(r["event_title"])[:70])}</a>\n'
             f'   {h.escape(str(r["answer"])[:50])}: Markt {r["polymarket_price"]*100:.0f}% · '
             f'KI {r["araistotle_prob"]*100:.0f}% · Edge {r["edge"]*100:+.0f}%')
-    lines.append(f"\n{len(with_edge)} von {len(rows)} Märkten geprüft.")
+    pending = sum("läuft noch" in r["ai_status"] for r in rows)
+    lines.append(f"\n{len(with_edge)} von {len(rows)} Märkten geprüft."
+                 + (f" ⏳ {pending} laufen noch." if pending else ""))
     return "\n".join(lines)
