@@ -31,6 +31,7 @@ jobs:
           MAX_NEW_GENERATIONS: ${{ vars.MAX_NEW_GENERATIONS || '5' }}
           ANALYZE_MODE: ${{ vars.ANALYZE_MODE || 'top' }}
           WAIT_MINUTES: ${{ vars.WAIT_MINUTES || '10' }}
+          USE_FEED: ${{ vars.USE_FEED || 'true' }}
         run: python scanner.py
 
       - name: Ergebnisse als Artefakt speichern
