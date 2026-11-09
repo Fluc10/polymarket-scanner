@@ -1,0 +1,38 @@
+name: Polymarket Scan
+
+on:
+  schedule:
+    # Alle 6 Stunden (Zeiten in UTC). Anpassen nach Wunsch.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:   # Manuell starten über "Run workflow"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Scanner ausführen
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_VOLUME: ${{ vars.MIN_VOLUME || '10000' }}
+          MAX_VOLUME: ${{ vars.MAX_VOLUME || '200000' }}
+        run: python scanner.py
+
+      - name: CSV als Artefakt speichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-scan
+          path: polymarket_scan.csv
+          retention-days: 14
+          if-no-files-found: ignore
