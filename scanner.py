@@ -186,11 +186,43 @@ def main():
     rows = build_rows(events)
     print(f"{len(rows)} Events im Volumenbereich.")
 
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     csv_bytes = rows_to_csv(rows)
+    html_bytes = rows_to_html(rows, stamp)
     with open("polymarket_scan.csv", "wb") as f:  # auch als Artefakt in GitHub
         f.write(csv_bytes)
+    with open("polymarket_scan.html", "wb") as f:
+        f.write(html_bytes)
 
-    send_to_telegram(csv_bytes, len(rows))
+    send_to_telegram(csv_bytes, html_bytes, len(rows), stamp)
+
+    # ---- ArAIstotle / Facticity-Analyse (nur wenn API-Key gesetzt) ----
+    import facticity
+    in_range = lambda ev: MIN_VOLUME <= event_total_volume(ev) <= MAX_VOLUME
+    insights = facticity.analyze(events, in_range)
+    if insights:
+        ins_csv = rows_to_csv(insights)
+        ins_html = facticity.insights_to_html(insights, stamp)
+        with open("araistotle_insights.csv", "wb") as f:
+            f.write(ins_csv)
+        with open("araistotle_insights.html", "wb") as f:
+            f.write(ins_html)
+        send_message(facticity.summary_message(insights))
+        send_document(f"araistotle_{stamp}.html", ins_html, "text/html",
+                      "🤖 ArAIstotle-Analyse – im Browser öffnen")
+        send_document(f"araistotle_{stamp}.csv", ins_csv, "text/csv")
+        print("ArAIstotle-Analyse an Telegram gesendet.")
+
+
+def send_message(text):
+    resp = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
+              "disable_web_page_preview": "true"},
+        timeout=60,
+    )
+    if not resp.ok:
+        print(f"Telegram-Fehler {resp.status_code}: {resp.text}", file=sys.stderr)
 
 
 if __name__ == "__main__":
