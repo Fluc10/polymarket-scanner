@@ -9,7 +9,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -24,14 +24,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FACTICITY_API_KEY: ${{ secrets.FACTICITY_API_KEY }}
           MIN_VOLUME: ${{ vars.MIN_VOLUME || '10000' }}
           MAX_VOLUME: ${{ vars.MAX_VOLUME || '200000' }}
-          MAX_INSIGHTS: ${{ vars.MAX_INSIGHTS || '20' }}
-          MAX_NEW_GENERATIONS: ${{ vars.MAX_NEW_GENERATIONS || '5' }}
-          ANALYZE_MODE: ${{ vars.ANALYZE_MODE || 'top' }}
-          WAIT_MINUTES: ${{ vars.WAIT_MINUTES || '10' }}
-          USE_FEED: ${{ vars.USE_FEED || 'true' }}
+          MIN_VOLUME_24H: ${{ vars.MIN_VOLUME_24H || '1000' }}
+          MAX_VOLUME_24H: ${{ vars.MAX_VOLUME_24H || '0' }}
         run: python scanner.py
 
       - name: Ergebnisse als Artefakt speichern
@@ -42,7 +38,5 @@ jobs:
           path: |
             polymarket_scan.csv
             polymarket_scan.html
-            araistotle_insights.csv
-            araistotle_insights.html
           retention-days: 14
           if-no-files-found: ignore
