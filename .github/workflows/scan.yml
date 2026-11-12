@@ -2,14 +2,14 @@ name: Polymarket Scan
 
 on:
   schedule:
-    # Alle 6 Stunden (Zeiten in UTC). Anpassen nach Wunsch.
-    - cron: "17 */6 * * *"
+    # Einmal täglich um 07:43 UTC (= 08:43 Wiener Winterzeit). Anpassen nach Wunsch.
+    - cron: "43 7 * * *"
   workflow_dispatch:   # Manuell starten über "Run workflow"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -24,10 +24,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MIN_VOLUME: ${{ vars.MIN_VOLUME || '10000' }}
-          MAX_VOLUME: ${{ vars.MAX_VOLUME || '200000' }}
-          MIN_VOLUME_24H: ${{ vars.MIN_VOLUME_24H || '1000' }}
-          MAX_VOLUME_24H: ${{ vars.MAX_VOLUME_24H || '0' }}
+          TOP_N: ${{ vars.TOP_N || '20' }}
+          MIN_SCORE: ${{ vars.MIN_SCORE || '0' }}
+          PRICE_MIN: ${{ vars.PRICE_MIN || '0.05' }}
+          PRICE_MAX: ${{ vars.PRICE_MAX || '0.95' }}
+          MIN_LIQUIDITY: ${{ vars.MIN_LIQUIDITY || '5000' }}
+          MIN_MARKET_VOLUME: ${{ vars.MIN_MARKET_VOLUME || '2000' }}
+          MIN_DAYS_LEFT: ${{ vars.MIN_DAYS_LEFT || '3' }}
+          MAX_DAYS_LEFT: ${{ vars.MAX_DAYS_LEFT || '120' }}
+          EXCLUDE_TAGS: ${{ vars.EXCLUDE_TAGS }}
         run: python scanner.py
 
       - name: Ergebnisse als Artefakt speichern
