@@ -2,15 +2,17 @@
 Polymarket Scanner
 ------------------
 Holt alle offenen Polymarket-Events über die öffentliche Gamma-API,
-filtert nach Gesamtvolumen (Summe über ALLE Antwortmöglichkeiten/Märkte
-eines Events) und schickt das Ergebnis als HTML (klickbare Links) + CSV per Telegram.
-Optional: ArAIstotle-Check der gefundenen Märkte (siehe facticity.py).
+filtert nach Gesamtvolumen (Summe über ALLE Antwortmöglichkeiten eines Events)
+und nach 24-Stunden-Volumen, sortiert nach 24h-Volumen und schickt das
+Ergebnis als HTML (klickbare Links) + CSV per Telegram.
 
 Konfiguration über Umgebungsvariablen (in GitHub als Secrets/Variables):
   TELEGRAM_BOT_TOKEN   (Secret, Pflicht)  – Token von @BotFather
   TELEGRAM_CHAT_ID     (Secret, Pflicht)  – Chat-ID, an die gesendet wird
-  MIN_VOLUME           (optional, Default 10000)
-  MAX_VOLUME           (optional, Default 200000)
+  MIN_VOLUME           (optional, Default 10000)  – Gesamtvolumen min.
+  MAX_VOLUME           (optional, Default 200000) – Gesamtvolumen max.
+  MIN_VOLUME_24H       (optional, Default 1000)   – 24h-Volumen min.
+  MAX_VOLUME_24H       (optional, Default 0)      – 24h-Volumen max. (0 = keine Grenze)
 """
 
 import csv
@@ -30,6 +32,8 @@ MAX_PAGES = 500  # Sicherheitsgrenze gegen Endlosschleifen
 
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000"))
 MAX_VOLUME = float(os.getenv("MAX_VOLUME", "200000"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H") or "1000")
+MAX_VOLUME_24H = float(os.getenv("MAX_VOLUME_24H") or "0")  # 0 = keine Obergrenze
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -101,12 +105,26 @@ def fetch_open_events():
 
     return events
 
+
 def event_total_volume(event):
     """Gesamtvolumen = Summe aller Märkte (Antwortmöglichkeiten) des Events."""
     markets = event.get("markets") or []
     summed = sum(to_float(m.get("volumeNum", m.get("volume"))) for m in markets)
     # Falls Märkte fehlen, das Volumen auf Event-Ebene nehmen
     return summed if markets else to_float(event.get("volume"))
+
+
+def event_volume_24h(event):
+    """24h-Volumen des Events (Summe über alle Antwortmöglichkeiten)."""
+    if event.get("volume24hr") is not None:
+        return to_float(event.get("volume24hr"))
+    return sum(to_float(m.get("volume24hr")) for m in event.get("markets") or [])
+
+
+def in_24h_range(v24):
+    if v24 < MIN_VOLUME_24H:
+        return False
+    return MAX_VOLUME_24H <= 0 or v24 <= MAX_VOLUME_24H
 
 
 def build_rows(events):
@@ -120,6 +138,9 @@ def build_rows(events):
 
         total = event_total_volume(ev)
         if not (MIN_VOLUME <= total <= MAX_VOLUME):
+            continue
+        v24 = event_volume_24h(ev)
+        if not in_24h_range(v24):
             continue
 
         markets = ev.get("markets") or []
@@ -140,7 +161,7 @@ def build_rows(events):
         rows.append({
             "event_title": ev.get("title", ""),
             "total_volume_usd": round(total, 2),
-            "volume_24h_usd": round(to_float(ev.get("volume24hr")), 2),
+            "volume_24h_usd": round(v24, 2),
             "liquidity_usd": round(to_float(ev.get("liquidity")), 2),
             "num_answers": len(markets),
             "num_open_answers": len(open_markets),
@@ -152,7 +173,7 @@ def build_rows(events):
             "event_id": ev_id,
         })
 
-    rows.sort(key=lambda r: r["total_volume_usd"], reverse=True)
+    rows.sort(key=lambda r: r["volume_24h_usd"], reverse=True)  # aktivste zuerst
     return rows
 
 
@@ -170,8 +191,8 @@ def rows_to_html(rows, stamp):
     """Tabelle als HTML: öffnet in jedem Browser, Links klickbar,
     Spalten per Klick auf die Überschrift sortierbar, mit Suchfeld."""
     headers = [
-        ("Event", "event_title"), ("Gesamtvolumen $", "total_volume_usd"),
-        ("24h $", "volume_24h_usd"), ("Liquidität $", "liquidity_usd"),
+        ("Event", "event_title"), ("24h-Volumen $", "volume_24h_usd"),
+        ("Gesamtvolumen $", "total_volume_usd"), ("Liquidität $", "liquidity_usd"),
         ("Antworten", "num_answers"), ("Top-Antwort", "top_answer"),
         ("Preis", "top_answer_price"), ("Ende", "end_date"), ("Tags", "tags"),
     ]
@@ -253,10 +274,12 @@ def send_to_telegram(csv_bytes, html_bytes, count, stamp):
     if not BOT_TOKEN or not CHAT_ID:
         sys.exit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt.")
 
+    max24 = f"${MAX_VOLUME_24H:,.0f}" if MAX_VOLUME_24H > 0 else "∞"
     caption = (
         f"📊 Polymarket-Scan {stamp} UTC\n"
-        f"{count} Events mit Gesamtvolumen "
-        f"${MIN_VOLUME:,.0f} – ${MAX_VOLUME:,.0f}\n"
+        f"{count} Events · Gesamtvolumen ${MIN_VOLUME:,.0f} – ${MAX_VOLUME:,.0f} · "
+        f"24h-Volumen ${MIN_VOLUME_24H:,.0f} – {max24}\n"
+        f"Sortiert nach 24h-Volumen (aktivste zuerst).\n"
         f"👉 Die .html-Datei im Browser öffnen: Links sind klickbar."
     )
     send_document(f"polymarket_{stamp}.html", html_bytes, "text/html", caption)
@@ -279,34 +302,6 @@ def main():
         f.write(html_bytes)
 
     send_to_telegram(csv_bytes, html_bytes, len(rows), stamp)
-
-    # ---- ArAIstotle / Facticity-Analyse (nur wenn API-Key gesetzt) ----
-    import facticity
-    in_range = lambda ev: MIN_VOLUME <= event_total_volume(ev) <= MAX_VOLUME
-    insights = facticity.analyze(events, in_range)
-    if insights:
-        ins_csv = rows_to_csv(insights)
-        ins_html = facticity.insights_to_html(insights, stamp)
-        with open("araistotle_insights.csv", "wb") as f:
-            f.write(ins_csv)
-        with open("araistotle_insights.html", "wb") as f:
-            f.write(ins_html)
-        send_message(facticity.summary_message(insights))
-        send_document(f"araistotle_{stamp}.html", ins_html, "text/html",
-                      "🤖 ArAIstotle-Analyse – im Browser öffnen")
-        send_document(f"araistotle_{stamp}.csv", ins_csv, "text/csv")
-        print("ArAIstotle-Analyse an Telegram gesendet.")
-
-
-def send_message(text):
-    resp = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
-              "disable_web_page_preview": "true"},
-        timeout=60,
-    )
-    if not resp.ok:
-        print(f"Telegram-Fehler {resp.status_code}: {resp.text}", file=sys.stderr)
 
 
 if __name__ == "__main__":
