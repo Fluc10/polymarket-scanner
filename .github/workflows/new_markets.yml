@@ -1,0 +1,41 @@
+name: Neue Märkte
+
+on:
+  schedule:
+    - cron: "27 * * * *"   # stündlich zur Minute 27
+  workflow_dispatch:
+
+concurrency:
+  group: new-markets
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Zustand laden
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: new-markets-state-${{ github.run_id }}
+          restore-keys: new-markets-state-
+
+      - name: Neue Märkte prüfen
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW_MIN_VOLUME: ${{ vars.NEW_MIN_VOLUME }}
+          NEW_MAX_AGE_HOURS: ${{ vars.NEW_MAX_AGE_HOURS }}
+          NEW_EXCLUDE_TAGS: ${{ vars.NEW_EXCLUDE_TAGS }}
+          NEW_ESPORTS_MIN_VOLUME: ${{ vars.NEW_ESPORTS_MIN_VOLUME }}
+          NEW_ESPORTS_MAX_AGE_HOURS: ${{ vars.NEW_ESPORTS_MAX_AGE_HOURS }}
+        run: python new_markets.py
