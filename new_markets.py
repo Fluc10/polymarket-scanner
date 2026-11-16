@@ -11,7 +11,6 @@ Ergebnis: Telegram-Nachricht + eigene Datei neue_maerkte_*.html
 
 Zustand: .state/new_markets_state.json (bereits gemeldete Events).
 """
-import csv
 import json
 import os
 import re
@@ -22,6 +21,8 @@ from html import escape
 from zoneinfo import ZoneInfo
 
 import requests
+
+import orderbook
 
 GAMMA = "https://gamma-api.polymarket.com"
 STATE_FILE = os.path.join(".state", "new_markets_state.json")
@@ -277,6 +278,60 @@ def exa_short(a):
     return line
 
 
+def exa_direction(e):
+    """'ja' / 'nein' je nach Exa-Delta auf der getrackten Antwort, sonst None."""
+    m, p, ok = e.get("_pick") or (None, None, False)
+    a = e.get("_exa") or {}
+    if not m or not ok or not a or a.get("signal") == "unklar":
+        return None, None
+    try:
+        exa_p = float(a.get("einschaetzung_prozent"))
+    except (TypeError, ValueError):
+        return None, None
+    d = exa_p - p * 100
+    if abs(d) < 0.5:
+        return None, exa_p
+    return ("ja" if d > 0 else "nein"), exa_p
+
+
+def trade_info(e):
+    """Einstieg in Exas Richtung aus dem Orderbuch: dict oder None."""
+    b = e.get("_book")
+    side, exa_p = exa_direction(e)
+    if not b or not side:
+        return None
+    entry = b.get(f"einstieg_{side}")
+    ok, why = orderbook.tradable(b, side)
+    fair = exa_p if side == "ja" else 100 - exa_p
+    return {"richtung": side, "einstieg": entry, "gefuellt": b.get(f"gefuellt_{side}"),
+            "spread": orderbook.spread(b, side), "handelbar": ok, "grund": why,
+            "edge": None if entry is None else round(fair - entry, 1)}
+
+
+def attach_books(events):
+    """Waehlt pro Event die getrackte Antwort und holt deren Orderbuch."""
+    for e in events:
+        e["_pick"] = pick_market(e)
+    todo = [e for e in events if e["_pick"][0]]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for e, b in zip(todo, pool.map(lambda x: orderbook.market_book(x["_pick"][0]), todo)):
+            e["_book"] = b
+
+
+def trade_short(e):
+    """Telegram-Zeile mit echtem Einstiegspreis."""
+    t = trade_info(e)
+    if not t:
+        return ""
+    side = "Ja" if t["richtung"] == "ja" else "Nein"
+    if t["einstieg"] is None:
+        return f"💧 {side}: kein Orderbuch"
+    flag = "✅ handelbar" if t["handelbar"] else f"⚠️ {t['grund']}"
+    edge = "" if t["edge"] is None else f" · Edge nach Einstieg <b>{t['edge']:+.1f} PP</b>"
+    return (f"💧 Einstieg {side} {t['einstieg']:.1f}¢ für {orderbook.TRADE_SIZE:.0f}$"
+            f" (Spread {t['spread']:.0f}¢){edge} · {flag}")
+
+
 # ---------------------------------------------------------------- Gruppierung
 
 def keywords(title):
@@ -359,6 +414,9 @@ def event_line(e, now):
             f'   {top_answers(e)}')
     if e.get("_exa"):
         line += "\n   " + exa_short(e["_exa"])
+    ts = trade_short(e)
+    if ts:
+        line += "\n   " + ts
     return line
 
 
@@ -394,6 +452,15 @@ def build_html(groups, now, stamp):
                             f'<br><small>{srcs}</small></td>')
             else:
                 exa_cell = '<td data-v="9"><small>nicht analysiert</small></td>'
+            t = trade_info(e)
+            if t and t["einstieg"] is not None:
+                side = "Ja" if t["richtung"] == "ja" else "Nein"
+                trade_cell = (f'<td data-v="{t["edge"] if t["edge"] is not None else -999}">'
+                              f'{side} {t["einstieg"]:.1f}¢ · Spread {t["spread"]:.0f}¢<br>'
+                              f'Edge {t["edge"]:+.1f} PP<br>'
+                              f'{"✅ handelbar" if t["handelbar"] else "⚠️ " + escape(t["grund"])}</td>')
+            else:
+                trade_cell = '<td data-v="-999"><small>–</small></td>'
             rows.append(
                 "<tr>"
                 f"<td>{kind}</td>"
@@ -404,10 +471,11 @@ def build_html(groups, now, stamp):
                 f'<td class="n" data-v="{age_h:.1f}">{age_h:.0f} h</td>'
                 f"<td>{top_answers(e)}</td>"
                 f"{exa_cell}"
+                f"{trade_cell}"
                 "</tr>"
             )
     cols = ["Art", "Thema", "Event", "Volumen", "Liquidität", "Alter", "Top-Antworten (Ja-Preis)",
-            "Exa-Analyse"]
+            "Exa-Analyse", f"Einstieg ({orderbook.TRADE_SIZE:.0f} $, ≤{orderbook.FILL_WINDOW:.0f}¢)"]
     head = "".join(f'<th onclick="sortBy({i})">{c}</th>' for i, c in enumerate(cols))
     return f"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -486,6 +554,9 @@ LOG_FIELDS = [
     "erfasst_am", "event_id", "event_slug", "event", "art", "market_id", "antwort", "enddatum",
     "volumen", "liquiditaet", "spread", "markt_prozent", "exa_prozent", "delta_pp", "signal",
     "nachrichtenlage", "begruendung", "quellen",
+    # Orderbuch bei Erfassung (Cent) - Einstieg = Durchschnittspreis fuer TRADE_SIZE $ innerhalb FILL_WINDOW
+    "ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja", "einstieg_nein",
+    "gefuellt_nein", "richtung", "einstieg", "edge_pp", "handelbar", "handelbar_grund", "trade_size",
 ]
 
 
@@ -522,48 +593,57 @@ def pick_market(e):
 
 def log_markets(events, now):
     """Haengt alle neuen Maerkte (mit oder ohne Exa-Analyse) an data/exa_log.csv an."""
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    new_file = not os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
-        if new_file:
-            w.writeheader()
-        for e in events:
-            m, p, exa_ok = pick_market(e)
-            if not m:
-                continue
-            a = e.get("_exa") or {}
-            exa_p = None
-            if a and exa_ok and a.get("signal") != "unklar":
-                try:
-                    exa_p = float(a.get("einschaetzung_prozent"))
-                except (TypeError, ValueError):
-                    exa_p = None
+    rows = []
+    for e in events:
+        m, p, exa_ok = e.get("_pick") or pick_market(e)
+        if not m:
+            continue
+        a = e.get("_exa") or {}
+        exa_p = None
+        if a and exa_ok and a.get("signal") != "unklar":
             try:
-                spread = float(m.get("spread")) * 100
+                exa_p = float(a.get("einschaetzung_prozent"))
             except (TypeError, ValueError):
-                spread = None
-            mkt = round(p * 100, 1)
-            w.writerow({
-                "erfasst_am": now.strftime("%Y-%m-%d %H:%M"),
-                "event_id": e.get("id"),
-                "event_slug": e.get("slug", ""),
-                "event": e.get("title", ""),
-                "art": "Esports" if e.get("_esports") else "Allgemein",
-                "market_id": m.get("id"),
-                "antwort": m.get("groupItemTitle") or "Ja",
-                "enddatum": (m.get("endDate") or e.get("endDate") or "")[:10],
-                "volumen": round(float(e.get("volume") or 0)),
-                "liquiditaet": round(float(e.get("liquidity") or 0)),
-                "spread": "" if spread is None else round(spread, 1),
-                "markt_prozent": mkt,
-                "exa_prozent": "" if exa_p is None else round(exa_p, 1),
-                "delta_pp": "" if exa_p is None else round(exa_p - mkt, 1),
-                "signal": a.get("signal", "") if a else "",
-                "nachrichtenlage": a.get("nachrichtenlage", "") if a else "",
-                "begruendung": a.get("begruendung", "") if a else "",
-                "quellen": " | ".join(q["url"] for q in a.get("quellen") or []) if a else "",
-            })
+                exa_p = None
+        b = e.get("_book") or {}
+        sp = orderbook.spread(b, "ja") if b else None
+        if sp is None:
+            try:
+                sp = float(m.get("spread")) * 100
+            except (TypeError, ValueError):
+                sp = None
+        mkt = round(p * 100, 1)
+        t = trade_info(e) or {}
+        rows.append({
+            "erfasst_am": now.strftime("%Y-%m-%d %H:%M"),
+            "event_id": e.get("id"),
+            "event_slug": e.get("slug", ""),
+            "event": e.get("title", ""),
+            "art": "Esports" if e.get("_esports") else "Allgemein",
+            "market_id": m.get("id"),
+            "antwort": m.get("groupItemTitle") or "Ja",
+            "enddatum": (m.get("endDate") or e.get("endDate") or "")[:10],
+            "volumen": round(float(e.get("volume") or 0)),
+            "liquiditaet": round(float(e.get("liquidity") or 0)),
+            "spread": "" if sp is None else round(sp, 1),
+            "markt_prozent": mkt,
+            "exa_prozent": "" if exa_p is None else round(exa_p, 1),
+            "delta_pp": "" if exa_p is None else round(exa_p - mkt, 1),
+            "signal": a.get("signal", "") if a else "",
+            "nachrichtenlage": a.get("nachrichtenlage", "") if a else "",
+            "begruendung": a.get("begruendung", "") if a else "",
+            "quellen": " | ".join(q["url"] for q in a.get("quellen") or []) if a else "",
+            **{k: ("" if b.get(k) is None else b.get(k)) for k in
+               ("ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
+                "einstieg_nein", "gefuellt_nein")},
+            "richtung": t.get("richtung", ""),
+            "einstieg": "" if t.get("einstieg") is None else t["einstieg"],
+            "edge_pp": "" if t.get("edge") is None else t["edge"],
+            "handelbar": "" if not t else ("ja" if t["handelbar"] else "nein"),
+            "handelbar_grund": t.get("grund", ""),
+            "trade_size": orderbook.TRADE_SIZE,
+        })
+    orderbook.csv_append(LOG_FILE, LOG_FIELDS, rows)
 
 
 # ---------------------------------------------------------------- State
@@ -628,6 +708,7 @@ def main():
         return
 
     analyze_all(fresh)
+    attach_books(fresh)
     log_markets(fresh, now)
 
     # Google Sheet sofort mit den neuen Maerkten aktualisieren (Fehler stoppen den Alarm nicht)
