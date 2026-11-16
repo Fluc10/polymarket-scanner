@@ -11,6 +11,7 @@ Ergebnis: Telegram-Nachricht + eigene Datei neue_maerkte_*.html
 
 Zustand: .state/new_markets_state.json (bereits gemeldete Events).
 """
+import csv
 import json
 import os
 import re
@@ -24,6 +25,8 @@ import requests
 
 GAMMA = "https://gamma-api.polymarket.com"
 STATE_FILE = os.path.join(".state", "new_markets_state.json")
+# Dauerhaftes Protokoll im Repo (wird vom Workflow committed) fuer exa_tracker.py
+LOG_FILE = os.path.join("data", "exa_log.csv")
 TZ = ZoneInfo("Europe/Vienna")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -477,6 +480,92 @@ def send_blocks(header, blocks):
         send(msg)
 
 
+# ---------------------------------------------------------------- Protokoll fuer Tracking
+
+LOG_FIELDS = [
+    "erfasst_am", "event_id", "event_slug", "event", "art", "market_id", "antwort", "enddatum",
+    "volumen", "liquiditaet", "spread", "markt_prozent", "exa_prozent", "delta_pp", "signal",
+    "nachrichtenlage", "begruendung", "quellen",
+]
+
+
+def open_markets(e):
+    out = []
+    for m in e.get("markets") or []:
+        if m.get("closed"):
+            continue
+        try:
+            p = float(json.loads(m.get("outcomePrices") or "[]")[0])
+        except (ValueError, IndexError, TypeError):
+            continue
+        out.append((m, p))
+    return out
+
+
+def pick_market(e):
+    """Welche Antwort wird getrackt: die von Exa genannte, sonst die einzige / teuerste.
+    Rueckgabe: (market, preis, exa_passt) - exa_passt=True, wenn Exas Antwort zu diesem Markt gehoert."""
+    mk = open_markets(e)
+    if not mk:
+        return None, None, False
+    if len(mk) == 1:
+        return mk[0][0], mk[0][1], True
+    a = str((e.get("_exa") or {}).get("antwort") or "").strip().lower()
+    if a and a not in ("ja", "yes"):
+        for m, p in mk:
+            name = str(m.get("groupItemTitle") or "").strip().lower()
+            if name and (name == a or name in a or a in name):
+                return m, p, True
+    m, p = max(mk, key=lambda x: x[1])
+    return m, p, False
+
+
+def log_markets(events, now):
+    """Haengt alle neuen Maerkte (mit oder ohne Exa-Analyse) an data/exa_log.csv an."""
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    new_file = not os.path.exists(LOG_FILE)
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        if new_file:
+            w.writeheader()
+        for e in events:
+            m, p, exa_ok = pick_market(e)
+            if not m:
+                continue
+            a = e.get("_exa") or {}
+            exa_p = None
+            if a and exa_ok and a.get("signal") != "unklar":
+                try:
+                    exa_p = float(a.get("einschaetzung_prozent"))
+                except (TypeError, ValueError):
+                    exa_p = None
+            try:
+                spread = float(m.get("spread")) * 100
+            except (TypeError, ValueError):
+                spread = None
+            mkt = round(p * 100, 1)
+            w.writerow({
+                "erfasst_am": now.strftime("%Y-%m-%d %H:%M"),
+                "event_id": e.get("id"),
+                "event_slug": e.get("slug", ""),
+                "event": e.get("title", ""),
+                "art": "Esports" if e.get("_esports") else "Allgemein",
+                "market_id": m.get("id"),
+                "antwort": m.get("groupItemTitle") or "Ja",
+                "enddatum": (m.get("endDate") or e.get("endDate") or "")[:10],
+                "volumen": round(float(e.get("volume") or 0)),
+                "liquiditaet": round(float(e.get("liquidity") or 0)),
+                "spread": "" if spread is None else round(spread, 1),
+                "markt_prozent": mkt,
+                "exa_prozent": "" if exa_p is None else round(exa_p, 1),
+                "delta_pp": "" if exa_p is None else round(exa_p - mkt, 1),
+                "signal": a.get("signal", "") if a else "",
+                "nachrichtenlage": a.get("nachrichtenlage", "") if a else "",
+                "begruendung": a.get("begruendung", "") if a else "",
+                "quellen": " | ".join(q["url"] for q in a.get("quellen") or []) if a else "",
+            })
+
+
 # ---------------------------------------------------------------- State
 
 def load_state():
@@ -539,6 +628,7 @@ def main():
         return
 
     analyze_all(fresh)
+    log_markets(fresh, now)
 
     groups = group_events(fresh)
     blocks = []
