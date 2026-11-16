@@ -32,11 +32,13 @@ jobs:
           key: new-markets-state-${{ github.run_id }}
           restore-keys: new-markets-state-
 
-      - name: Neue Märkte prüfen + Exa-Analyse
+      - name: Neue Märkte prüfen + Exa-Analyse + Google Sheet
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
           EXA_MAX_PER_RUN: ${{ vars.EXA_MAX_PER_RUN }}
           NEW_MIN_VOLUME: ${{ vars.NEW_MIN_VOLUME }}
           NEW_MAX_AGE_HOURS: ${{ vars.NEW_MAX_AGE_HOURS }}
