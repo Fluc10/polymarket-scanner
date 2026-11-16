@@ -1,0 +1,55 @@
+name: Exa-Tracking
+
+on:
+  schedule:
+    - cron: "13 6 * * *"     # täglich 07:13 Wien (Winterzeit) → Sheet aktualisieren
+    - cron: "43 6 1 * *"     # am 1. jedes Monats 07:43 Wien → Monats-Feedback
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "update oder monthly"
+        required: false
+        default: "update"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: polymarket-data
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Google Sheet aktualisieren + Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          TRACKER_MIN_DELTA: ${{ vars.TRACKER_MIN_DELTA }}
+          TRACKER_MODE: ${{ github.event.schedule == '43 6 1 * *' && 'monthly' || github.event.inputs.mode || 'update' }}
+        run: python exa_tracker.py
+
+      - name: Schnappschüsse speichern
+        run: |
+          if [ -d data ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898315+github-actions[bot]@users.noreply.github.com"
+            git add data/
+            if ! git diff --cached --quiet; then
+              git commit -m "Exa-Tracking Schnappschuss"
+              git pull --rebase
+              git push
+            fi
+          fi
