@@ -17,6 +17,7 @@ import io
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
@@ -24,11 +25,14 @@ from zoneinfo import ZoneInfo
 import requests
 
 import gsheet
+import orderbook
 
 GAMMA = "https://gamma-api.polymarket.com"
 LOG_FILE = os.path.join("data", "exa_log.csv")
 SNAP_FILE = os.path.join("data", "exa_snapshots.csv")
-SNAP_FIELDS = ["datum", "market_id", "prozent", "geschlossen", "ergebnis"]
+SNAP_FIELDS = ["datum", "market_id", "prozent", "geschlossen", "ergebnis",
+               "ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
+               "einstieg_nein", "gefuellt_nein"]
 TZ = ZoneInfo("Europe/Vienna")
 SIGNAL_TEXT = {"unterbewertet": "unterbewertet", "ueberbewertet": "überbewertet",
                "fair": "fair", "unklar": "unklar"}
@@ -47,7 +51,7 @@ def env_float(name, default):
 
 # Ab welchem Abstand (Prozentpunkte) zwischen Exa und Markt ein Signal als "Trade" zaehlt
 SIGNAL_MIN_DELTA = env_float("TRACKER_MIN_DELTA", 5)
-STAKE = 10.0  # simulierter Einsatz pro Signal in $
+STAKE = orderbook.TRADE_SIZE  # simulierter Einsatz pro Trade in $ (Variable TRADE_SIZE, Standard 100)
 
 
 # ---------------------------------------------------------------- Daten
@@ -122,24 +126,25 @@ def outcome_of(m):
 
 
 def save_snapshot(markets, snaps, today):
-    done = {(s["datum"], s["market_id"]) for s in snaps}
+    """Tages-Schnappschuss: Mittelpreis + Orderbuch (nur offene Maerkte)."""
+    done = {(x["datum"], x["market_id"]) for x in snaps}
+    todo = [(mid, m) for mid, m in markets.items()
+            if yes_price(m) is not None and (today, mid) not in done]
+    open_ms = [m for _, m in todo if not m.get("closed")]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        books = dict(zip((str(m.get("id")) for m in open_ms), pool.map(orderbook.market_book, open_ms)))
     new = []
-    for mid, m in markets.items():
-        p = yes_price(m)
-        if p is None or (today, mid) in done:
-            continue
+    for mid, m in todo:
         o = outcome_of(m)
-        new.append({"datum": today, "market_id": mid, "prozent": round(p * 100, 1),
-                    "geschlossen": "ja" if m.get("closed") else "nein",
-                    "ergebnis": "" if o is None else o})
+        b = books.get(mid) or {}
+        row = {"datum": today, "market_id": mid, "prozent": round(yes_price(m) * 100, 1),
+               "geschlossen": "ja" if m.get("closed") else "nein",
+               "ergebnis": "" if o is None else o}
+        for k in SNAP_FIELDS[5:]:
+            row[k] = "" if b.get(k) is None else b.get(k)
+        new.append(row)
     if new:
-        os.makedirs(os.path.dirname(SNAP_FILE), exist_ok=True)
-        new_file = not os.path.exists(SNAP_FILE)
-        with open(SNAP_FILE, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=SNAP_FIELDS)
-            if new_file:
-                w.writeheader()
-            w.writerows(new)
+        orderbook.csv_append(SNAP_FILE, SNAP_FIELDS, new)
     return snaps + new, len(new)
 
 
@@ -149,20 +154,21 @@ def brier(p, o):
     return (p / 100 - o) ** 2
 
 
-def simulate(r, with_spread):
-    """Simulierter Gewinn eines $10-Trades in Richtung Exa. None wenn kein Signal / offen."""
-    d, mkt, o = r["delta"], r["markt"], r["ergebnis"]
-    if d is None or o is None or mkt is None or abs(d) < SIGNAL_MIN_DELTA:
+def pnl(stake, price_c, won):
+    """Gewinn eines Kaufs fuer `stake` $ zum Preis `price_c` Cent, Ausgang won (1/0)."""
+    if price_c is None or price_c <= 0 or won is None or not stake:
         return None
-    half = (r["spread"] or 0) / 2 if with_spread else 0
-    if d > 0:  # Exa hoeher -> Ja kaufen
-        price = min(99.0, mkt + half) / 100
-        return STAKE / price * o - STAKE
-    price = min(99.0, (100 - mkt) + half) / 100  # Nein kaufen
-    return STAKE / price * (1 - o) - STAKE
+    return round(stake / (price_c / 100) * won - stake, 2)
 
 
-def build_rows(log, markets):
+def snap_book(x):
+    return {k: num(x.get(k)) for k in SNAP_FIELDS[5:]}
+
+
+def build_rows(log, markets, snaps):
+    by_market = {}
+    for x in sorted(snaps, key=lambda x: x["datum"]):
+        by_market.setdefault(x["market_id"], []).append(x)
     rows = []
     for x in log:
         mid = str(x.get("market_id") or "")
@@ -178,24 +184,76 @@ def build_rows(log, markets):
         exa_right = None
         if o is not None and exa is not None and mkt is not None:
             exa_right = abs(o * 100 - exa) < abs(o * 100 - mkt)
+
+        side = x.get("richtung") or ("ja" if (delta or 0) > 0 else "nein" if (delta or 0) < 0 else "")
+        won = None if o is None or not side else (o if side == "ja" else 1 - o)
+        is_signal = delta is not None and abs(delta) >= SIGNAL_MIN_DELTA and side
+        # Variante 1: theoretisch zum Mittelpreis bei Erfassung
+        mid_price = None if mkt is None or not side else (mkt if side == "ja" else 100 - mkt)
+        # Variante 2: sofort, echter Einstieg aus dem Orderbuch bei Erfassung
+        entry = num(x.get("einstieg"))
+        filled = num(x.get(f"gefuellt_{side}")) if side else None
+        stake_now = min(STAKE, filled) if filled else None
+        # Variante 3: erster Tag, an dem der Markt in Exas Richtung handelbar war
+        cap_book = {k: num(x.get(k)) for k in SNAP_FIELDS[5:]}
+        first = None
+        if side:
+            if x.get("handelbar") == "ja":
+                first = (x.get("erfasst_am", "")[:10], entry)
+            else:
+                for sn in by_market.get(mid, []):
+                    if sn["datum"] < x.get("erfasst_am", "")[:10]:
+                        continue
+                    ok, _ = orderbook.tradable(snap_book(sn), side)
+                    if ok:
+                        first = (sn["datum"], num(sn.get(f"einstieg_{side}")))
+                        break
+        # Ausstieg jetzt: bester Bid in Exas Richtung aus dem letzten Schnappschuss
+        last = (by_market.get(mid) or [None])[-1]
+        exit_bid = num(last.get(f"{side}_bid")) if last and side else None
+        mtm = None
+        if stake_now and entry and exit_bid is not None and o is None:
+            mtm = round(stake_now / (entry / 100) * exit_bid / 100 - stake_now, 2)
+        elif stake_now and entry and won is not None:
+            mtm = pnl(stake_now, entry, won)
+
         r = {
             "erfasst": x.get("erfasst_am", ""), "art": x.get("art", ""),
             "event": x.get("event", ""), "slug": x.get("event_slug", ""),
             "antwort": x.get("antwort", ""), "ende": x.get("enddatum", ""),
             "markt": mkt, "exa": exa, "delta": delta,
             "signal": SIGNAL_TEXT.get(x.get("signal", ""), x.get("signal", "")),
-            "spread": num(x.get("spread")), "jetzt": now_p, "bewegung": move,
-            "richtung_exa": toward,
+            "richtung": {"ja": "Ja", "nein": "Nein"}.get(side, ""),
+            "ja_ba": _ba(cap_book.get("ja_bid"), cap_book.get("ja_ask")),
+            "nein_ba": _ba(cap_book.get("nein_bid"), cap_book.get("nein_ask")),
+            "spread": num(x.get("spread")), "einstieg": entry, "gefuellt": filled,
+            "edge": num(x.get("edge_pp")),
+            "handelbar": ("ja" if x.get("handelbar") == "ja" else
+                          (x.get("handelbar_grund") or "nein") if x.get("handelbar") else ""),
+            "handelbar_seit": "" if not side else (
+                f"{first[0]} @ {first[1]:.1f}¢" if first and first[1] is not None else
+                "bei Erfassung" if first else
+                "noch nicht" if not (m and m.get("closed")) else "nie (Markt geschlossen)"),
+            "jetzt": now_p, "bewegung": move, "richtung_exa": toward,
+            "ausstieg": exit_bid, "mtm": mtm,
             "status": ("aufgelöst: JA" if o == 1 else "aufgelöst: NEIN" if o == 0
                        else "geschlossen" if m and m.get("closed") else "offen"),
             "ergebnis": o, "exa_besser": exa_right,
+            "pnl_mitte": pnl(STAKE, mid_price, won) if is_signal else None,
+            "pnl_sofort": pnl(stake_now, entry, won) if is_signal else None,
+            "pnl_handelbar": pnl(STAKE, first[1], won) if is_signal and first and first[1] else None,
             "nachrichten": x.get("nachrichtenlage", ""), "begruendung": x.get("begruendung", ""),
             "quellen": x.get("quellen", ""), "market_id": mid,
         }
-        r["pnl"] = simulate(r, False)
-        r["pnl_spread"] = simulate(r, True)
         rows.append(r)
     return rows
+
+
+def _ba(bid, ask):
+    if bid is None and ask is None:
+        return ""
+    f = lambda v: "–" if v is None else f"{v:.0f}"
+    return f"{f(bid)} / {f(ask)}"
 
 
 def stats(rows):
@@ -204,15 +262,24 @@ def stats(rows):
     sig = [r for r in res if r["delta"] is not None and abs(r["delta"]) >= SIGNAL_MIN_DELTA]
     hits = [r for r in sig if (r["delta"] > 0) == (r["ergebnis"] == 1)]
     open_moves = [r for r in with_exa if r["richtung_exa"] is not None and r["status"] == "offen"]
-    pnl = [r["pnl"] for r in rows if r["pnl"] is not None]
-    pnl_s = [r["pnl_spread"] for r in rows if r["pnl_spread"] is not None]
+    sig_all = [r for r in with_exa if r["delta"] is not None and abs(r["delta"]) >= SIGNAL_MIN_DELTA]
+
+    def total(key):
+        v = [r[key] for r in rows if r.get(key) is not None]
+        return (round(sum(v), 2), len(v))
+
     return {
         "maerkte": len(rows), "mit_exa": len(with_exa), "aufgeloest": len(res),
         "exa_naeher": sum(1 for r in res if r["exa_besser"]),
         "brier_exa": sum(brier(r["exa"], r["ergebnis"]) for r in res) / len(res) if res else None,
         "brier_markt": sum(brier(r["markt"], r["ergebnis"]) for r in res) / len(res) if res else None,
         "signale": len(sig), "treffer": len(hits),
-        "pnl": sum(pnl) if pnl else 0.0, "pnl_spread": sum(pnl_s) if pnl_s else 0.0, "trades": len(pnl),
+        "signale_alle": len(sig_all),
+        "handelbar_bei_erfassung": sum(1 for r in sig_all if r["handelbar"] == "ja"),
+        "spaeter_handelbar": sum(1 for r in sig_all if r["handelbar"] not in ("", "ja")
+                                 and r["handelbar_seit"][:1].isdigit()),
+        "pnl_mitte": total("pnl_mitte"), "pnl_sofort": total("pnl_sofort"),
+        "pnl_handelbar": total("pnl_handelbar"),
         "richtung_n": len(open_moves), "richtung_ok": sum(1 for r in open_moves if r["richtung_exa"]),
     }
 
@@ -256,22 +323,34 @@ def tables(rows, snaps, now):
     rows = sorted(rows, key=lambda r: r["erfasst"], reverse=True)
     links = [f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "" for r in rows]
 
+    T = f"{STAKE:.0f} $"
     maerkte = {
         "title": "Märkte",
-        "header": ["Erfasst (UTC)", "Art", "Event", "Antwort", "Ende", "Markt bei Erfassung %", "Exa %",
-                   "Delta (Exa−Markt) PP", "Signal", "Spread bei Erfassung ¢", "Markt jetzt %",
-                   "Bewegung seit Erfassung PP", "Markt bewegt sich Richtung Exa?", "Status",
-                   "Exa näher am Ergebnis?", "Sim. Gewinn $10 (ohne Spread)", "Sim. Gewinn $10 (mit Spread)",
+        "header": ["Erfasst (UTC)", "Art", "Event", "Antwort", "Ende",
+                   "Markt-Mitte bei Erfassung %", "Exa %", "Delta (Exa−Markt) PP", "Signal",
+                   "Richtung (Exa)", "Ja Bid / Ask ¢", "Nein Bid / Ask ¢", "Spread Ja ¢",
+                   f"Einstieg ¢ ({T}, ≤{orderbook.FILL_WINDOW:.0f}¢ Tiefe)", "Gefüllt $",
+                   "Edge nach Einstieg PP", "Handelbar bei Erfassung", "Handelbar seit",
+                   "Markt-Mitte jetzt %", "Bewegung seit Erfassung PP", "Markt bewegt sich Richtung Exa?",
+                   "Ausstieg jetzt (Bid) ¢", f"Wert bei Verkauf jetzt $ ({T} sofort)",
+                   "Status", "Exa näher am Ergebnis?",
+                   f"Gewinn {T} theoretisch (Mitte)", f"Gewinn {T} sofort (Orderbuch)",
+                   f"Gewinn {T} ab handelbar",
                    "Nachrichtenlage (Exa)", "Begründung (Exa)", "Quellen"],
         "rows": [[r["erfasst"], r["art"], r["event"], r["antwort"], r["ende"], r["markt"], r["exa"],
-                  r["delta"], r["signal"], r["spread"], r1(r["jetzt"]), r["bewegung"], yn(r["richtung_exa"]),
-                  r["status"], yn(r["exa_besser"]), r1(r["pnl"], 2), r1(r["pnl_spread"], 2),
+                  r["delta"], r["signal"], r["richtung"], r["ja_ba"], r["nein_ba"], r["spread"],
+                  r["einstieg"], r["gefuellt"], r["edge"], r["handelbar"], r["handelbar_seit"],
+                  r1(r["jetzt"]), r["bewegung"], yn(r["richtung_exa"]), r["ausstieg"], r["mtm"],
+                  r["status"], yn(r["exa_besser"]), r["pnl_mitte"], r["pnl_sofort"], r["pnl_handelbar"],
                   r["nachrichten"], r["begruendung"], r["quellen"]] for r in rows],
-        "widths": [16, 10, 48, 22, 11, 11, 9, 11, 14, 10, 10, 12, 12, 15, 12, 12, 12, 60, 50, 40],
+        "widths": [16, 10, 48, 22, 11, 11, 9, 11, 14, 9, 11, 11, 9, 13, 10, 11, 22, 20,
+                   10, 12, 12, 10, 13, 15, 12, 13, 13, 13, 60, 50, 40],
         "link_col": 2, "links": links,
-        "num_cols": {5: "0.0", 6: "0.0", 7: "+0.0;-0.0;0.0", 9: "0.0", 10: "0.0", 11: "+0.0;-0.0;0.0",
-                     15: '+0.00" $";-0.00" $";0.00" $"', 16: '+0.00" $";-0.00" $";0.00" $"'},
-        "posneg_cols": [7, 11, 15, 16], "yesno_cols": [12, 14], "wrap_cols": [17, 18, 19],
+        "num_cols": {5: "0.0", 6: "0.0", 7: "+0.0;-0.0;0.0", 12: "0.0", 13: "0.0", 14: "0.00",
+                     15: "+0.0;-0.0;0.0", 18: "0.0", 19: "+0.0;-0.0;0.0", 21: "0.0",
+                     22: '+0.00" $";-0.00" $";0.00" $"', 25: '+0.00" $";-0.00" $";0.00" $"',
+                     26: '+0.00" $";-0.00" $";0.00" $"', 27: '+0.00" $";-0.00" $";0.00" $"'},
+        "posneg_cols": [7, 15, 19, 22, 25, 26, 27], "yesno_cols": [16, 20, 24], "wrap_cols": [28, 29, 30],
     }
 
     dates = sorted({s["datum"] for s in snaps})
@@ -295,208 +374,4 @@ def tables(rows, snaps, now):
         a_rows.append([title])
         a_rows.extend([
             ["Erfasste Märkte", s["maerkte"]],
-            ["davon mit Exa-Wahrscheinlichkeit", s["mit_exa"]],
-            ["davon aufgelöst", s["aufgeloest"]],
-            ["Exa näher am Ergebnis als der Markt",
-             f'{s["exa_naeher"]} von {s["aufgeloest"]} ({pct(s["exa_naeher"], s["aufgeloest"])})'],
-            ["Brier-Score Exa (kleiner = besser)", r1(s["brier_exa"], 4) if s["brier_exa"] is not None else "–"],
-            ["Brier-Score Markt (kleiner = besser)", r1(s["brier_markt"], 4) if s["brier_markt"] is not None else "–"],
-            [f"Signale mit |Delta| ≥ {SIGNAL_MIN_DELTA:.0f} PP (aufgelöst)", s["signale"]],
-            ["Richtung der Signale richtig", f'{s["treffer"]} von {s["signale"]} ({pct(s["treffer"], s["signale"])})'],
-            [f"Sim. Gewinn, je ${STAKE:.0f} pro Signal (ohne Spread)", round(s["pnl"], 2)],
-            [f"Sim. Gewinn, je ${STAKE:.0f} pro Signal (mit Spread)", round(s["pnl_spread"], 2)],
-            ["Offene Märkte: Preis bewegt sich Richtung Exa",
-             f'{s["richtung_ok"]} von {s["richtung_n"]} ({pct(s["richtung_ok"], s["richtung_n"])})'],
-            [],
-        ])
-
-    block(f"Gesamt (Stand {now.strftime('%d.%m.%Y %H:%M')})", rows)
-    block(f"Laufender Monat {cur}", [r for r in rows if r["erfasst"].startswith(cur)])
-    block(f"Vormonat {prev}", [r for r in rows if r["erfasst"].startswith(prev)])
-    bold.append(len(a_rows))
-    a_rows.append(["Kalibrierung: Wenn Exa X % sagt – wie oft tritt es wirklich ein?"])
-    bold.append(len(a_rows))
-    a_rows.append(["Exa-Bereich", "Anzahl", "Ø Exa %", "Tatsächlich %", "Ø Markt %"])
-    a_rows.extend(calibration(rows))
-    a_rows.append([])
-    bold.append(len(a_rows))
-    a_rows.append(["Erklärung"])
-    for t in [
-        "Delta = Exa-Wahrscheinlichkeit minus Marktpreis bei Erfassung (Prozentpunkte). Positiv = Exa hält die Antwort für wahrscheinlicher als der Markt.",
-        "Exa näher am Ergebnis: Nach Auflösung (100 % oder 0 %) – war Exas Zahl näher dran als der Marktpreis?",
-        "Brier-Score: mittlerer quadratischer Fehler der Wahrscheinlichkeiten. 0 = perfekt, 0,25 = Münzwurf. Exa sollte unter dem Markt liegen.",
-        f"Sim. Gewinn: ${STAKE:.0f} in Richtung Exa gesetzt (Ja wenn Delta > 0, Nein wenn Delta < 0) zum Preis bei Erfassung. "
-        "'Mit Spread' rechnet den halben Spread beim Einstieg drauf – realistischer.",
-        "Kalibrierung: Bei guter Kalibrierung liegt 'Tatsächlich %' nahe an 'Ø Exa %'.",
-    ]:
-        a_rows.append([t])
-    auswertung = {"title": "Auswertung", "header": None, "rows": a_rows,
-                  "widths": [60, 18, 12, 14, 12], "bold_rows": bold, "wrap_cols": [0]}
-    return [maerkte, verlauf, auswertung]
-
-
-# ---------------------------------------------------------------- Excel (Ersatz ohne Google)
-
-def build_excel(tabs):
-    from openpyxl import Workbook
-    from openpyxl.formatting.rule import CellIsRule
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    head_fill, head_font = PatternFill("solid", fgColor="0B5F3A"), Font(color="FFFFFF", bold=True)
-    green, red = PatternFill("solid", fgColor="D9F2E3"), PatternFill("solid", fgColor="F8D7DA")
-    wb = Workbook()
-    wb.remove(wb.active)
-    for t in tabs:
-        ws = wb.create_sheet(t["title"])
-        hdr = 1 if t.get("header") else 0
-        if hdr:
-            ws.append(t["header"])
-        for row in t["rows"]:
-            ws.append(row)
-        for i, w in enumerate(t.get("widths") or [], 1):
-            ws.column_dimensions[get_column_letter(i)].width = w
-        n, ncols = ws.max_row, ws.max_column
-        if hdr:
-            for c in range(1, ncols + 1):
-                cell = ws.cell(row=1, column=c)
-                cell.fill, cell.font = head_fill, head_font
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{n}"
-        for c, fmt in (t.get("num_cols") or {}).items():
-            for r in range(hdr + 1, n + 1):
-                ws.cell(row=r, column=c + 1).number_format = fmt.replace('" $"', ' $')
-        for c in t.get("wrap_cols") or []:
-            for r in range(hdr + 1, n + 1):
-                ws.cell(row=r, column=c + 1).alignment = Alignment(wrap_text=True, vertical="top")
-        for r in t.get("bold_rows") or []:
-            for c in range(1, ncols + 1):
-                ws.cell(row=hdr + r + 1, column=c).font = Font(bold=True, size=12)
-        if n > hdr:
-            for c in t.get("posneg_cols") or []:
-                rng = f"{get_column_letter(c + 1)}{hdr + 1}:{get_column_letter(c + 1)}{n}"
-                ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["0"], fill=green))
-                ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=red))
-            for c in t.get("yesno_cols") or []:
-                rng = f"{get_column_letter(c + 1)}{hdr + 1}:{get_column_letter(c + 1)}{n}"
-                ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"ja"'], fill=green))
-                ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"nein"'], fill=red))
-        lc = t.get("link_col")
-        if lc is not None:
-            for i, url in enumerate(t.get("links") or []):
-                if url:
-                    cell = ws.cell(row=hdr + i + 1, column=lc + 1)
-                    cell.hyperlink = url
-                    cell.font = Font(color="0B5FFF", underline="single")
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-# ---------------------------------------------------------------- Telegram
-
-def send(text):
-    if not TOKEN or not CHAT_ID:
-        print(text)
-        return
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                            "disable_web_page_preview": "true"}, timeout=30)
-    if r.status_code != 200:
-        print("Telegram-Fehler:", r.status_code, r.text[:300])
-
-
-def send_document(filename, content, caption=""):
-    if not TOKEN or not CHAT_ID:
-        with open(filename, "wb") as f:
-            f.write(content)
-        print("Datei gespeichert:", filename)
-        return
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument",
-                      data={"chat_id": CHAT_ID, "caption": caption},
-                      files={"document": (filename, content,
-                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                      timeout=60)
-    if r.status_code != 200:
-        print("Telegram-Fehler:", r.status_code, r.text[:300])
-
-
-def fmt_stats(s):
-    lines = [f"Märkte: {s['maerkte']} · mit Exa: {s['mit_exa']} · aufgelöst: {s['aufgeloest']}"]
-    if s["aufgeloest"]:
-        lines.append(f"Exa näher am Ergebnis: <b>{s['exa_naeher']}/{s['aufgeloest']}</b> ({pct(s['exa_naeher'], s['aufgeloest'])})")
-        lines.append(f"Brier Exa {s['brier_exa']:.3f} vs. Markt {s['brier_markt']:.3f} (kleiner = besser)")
-    if s["signale"]:
-        lines.append(f"Signale ≥{SIGNAL_MIN_DELTA:.0f} PP richtig: <b>{s['treffer']}/{s['signale']}</b> ({pct(s['treffer'], s['signale'])})")
-        lines.append(f"Sim. Gewinn ({s['trades']} × ${STAKE:.0f}): {s['pnl']:+.2f} $ · mit Spread: <b>{s['pnl_spread']:+.2f} $</b>")
-    if s["richtung_n"]:
-        lines.append(f"Offene Märkte bewegen sich Richtung Exa: {s['richtung_ok']}/{s['richtung_n']} ({pct(s['richtung_ok'], s['richtung_n'])})")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------- Ablauf
-
-def sync_sheet():
-    """Nur das Google Sheet neu schreiben (fuer new_markets.py). Kein Telegram, kein Schnappschuss."""
-    if not gsheet.enabled():
-        return
-    log = read_csv(LOG_FILE)
-    if not log:
-        return
-    markets = fetch_markets(x.get("market_id") for x in log)
-    rows = build_rows(log, markets)
-    gsheet.write_tables(tables(rows, read_csv(SNAP_FILE), datetime.now(TZ)))
-    print(f"Google Sheet aktualisiert ({len(rows)} Märkte)")
-
-
-def main():
-    if os.environ.get("GITHUB_ACTIONS") and (not TOKEN or not CHAT_ID):
-        raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
-    now = datetime.now(TZ)
-    today = now.strftime("%Y-%m-%d")
-
-    log = read_csv(LOG_FILE)
-    if not log:
-        send("📊 <b>Exa-Tracking</b>\nNoch keine Märkte protokolliert – der Neue-Märkte-Alarm füllt das Protokoll automatisch.")
-        return
-
-    markets = fetch_markets(x.get("market_id") for x in log)
-    snaps, n_new = save_snapshot(markets, read_csv(SNAP_FILE), today)
-    rows = build_rows(log, markets)
-    tabs = tables(rows, snaps, now)
-
-    sheet_ok = False
-    if gsheet.enabled():
-        try:
-            gsheet.write_tables(tabs)
-            sheet_ok = True
-        except Exception as ex:  # Sheet-Fehler soll den Bericht nicht verhindern
-            print("Google-Sheet-Fehler:", ex)
-
-    cur, prev = months(now)
-    if MODE == "monthly":
-        text = (f"📈 <b>Monatliches Exa-Feedback – {prev}</b>\n\n"
-                f"<b>Märkte aus {prev}:</b>\n{fmt_stats(stats([r for r in rows if r['erfasst'].startswith(prev)]))}\n\n"
-                f"<b>Gesamt seit Start:</b>\n{fmt_stats(stats(rows))}")
-    else:
-        moved = sorted((r for r in rows if r["bewegung"] is not None and r["status"] == "offen"),
-                       key=lambda r: -abs(r["bewegung"]))[:5]
-        top = "\n".join(
-            f"{'📈' if r['bewegung'] > 0 else '📉'} {escape(r['event'][:60])} – {escape(r['antwort'][:20])}: "
-            f"{r['markt']:.0f}% → {r['jetzt']:.0f}%"
-            + (f" (Exa {r['exa']:.0f}%, {'✅ Richtung Exa' if r['richtung_exa'] else '❌ gegen Exa'})"
-               if r["exa"] is not None and r["richtung_exa"] is not None else "")
-            for r in moved if abs(r["bewegung"]) >= 3)
-        text = (f"📊 <b>Exa-Tracking – {now.strftime('%d.%m.%Y')}</b>\n\n{fmt_stats(stats(rows))}"
-                + (f"\n\n<b>Größte Bewegungen (offene Märkte):</b>\n{top}" if top else ""))
-    if sheet_ok:
-        text += f'\n\n📄 <a href="{gsheet.sheet_url()}">Google Sheet öffnen</a>'
-    send(text)
-    if not sheet_ok:
-        send_document(f"exa_tracking_{today}.xlsx", build_excel(tabs), "📊 Exa-Tracking – in Excel öffnen")
-    print(f"{len(rows)} Märkte, {n_new} neue Schnappschüsse, Modus {MODE}, Sheet {'ok' if sheet_ok else 'aus'}")
-
-
-if __name__ == "__main__":
-    main()
+            ["davon mit
