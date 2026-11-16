@@ -630,6 +630,16 @@ def main():
     analyze_all(fresh)
     log_markets(fresh, now)
 
+    # Google Sheet sofort mit den neuen Maerkten aktualisieren (Fehler stoppen den Alarm nicht)
+    sheet_link = ""
+    if os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        try:
+            import exa_tracker
+            exa_tracker.sync_sheet()
+            sheet_link = f'\n📄 <a href="{exa_tracker.gsheet.sheet_url()}">Tracking-Tabelle öffnen</a>'
+        except Exception as ex:
+            print("Google-Sheet-Fehler:", ex)
+
     groups = group_events(fresh)
     blocks = []
     for g in groups:
@@ -646,7 +656,7 @@ def main():
     title = "Neue Märkte der letzten" if first_run else "Neue Märkte"
     header = (f"🆕 <b>{title} {MAX_AGE_HOURS:.0f}h</b> ({now_local})" if first_run
               else f"🆕 <b>{title}</b> ab {money(MIN_VOLUME)} Volumen ({now_local})")
-    send_blocks(header, blocks)
+    send_blocks(header + sheet_link, blocks)
 
     stamp = now.astimezone(TZ).strftime("%Y-%m-%d_%H%M")
     send_document(f"neue_maerkte_{stamp}.html", build_html(groups, now, stamp),
