@@ -374,4 +374,225 @@ def tables(rows, snaps, now):
         a_rows.append([title])
         a_rows.extend([
             ["Erfasste Märkte", s["maerkte"]],
-            ["davon mit
+            ["davon mit Exa-Wahrscheinlichkeit", s["mit_exa"]],
+            ["davon aufgelöst", s["aufgeloest"]],
+            ["Exa näher am Ergebnis als der Markt",
+             f'{s["exa_naeher"]} von {s["aufgeloest"]} ({pct(s["exa_naeher"], s["aufgeloest"])})'],
+            ["Brier-Score Exa (kleiner = besser)", r1(s["brier_exa"], 4) if s["brier_exa"] is not None else "–"],
+            ["Brier-Score Markt (kleiner = besser)", r1(s["brier_markt"], 4) if s["brier_markt"] is not None else "–"],
+            [f"Signale mit |Delta| ≥ {SIGNAL_MIN_DELTA:.0f} PP (aufgelöst)", s["signale"]],
+            ["Richtung der Signale richtig", f'{s["treffer"]} von {s["signale"]} ({pct(s["treffer"], s["signale"])})'],
+            [f"Signale gesamt (|Delta| ≥ {SIGNAL_MIN_DELTA:.0f} PP)", s["signale_alle"]],
+            ["… davon handelbar bei Erfassung", s["handelbar_bei_erfassung"]],
+            ["… davon später handelbar geworden", s["spaeter_handelbar"]],
+            [f"Gewinn je {STAKE:.0f} $ – theoretisch zum Mittelpreis", s["pnl_mitte"][0], f'{s["pnl_mitte"][1]} Trades'],
+            [f"Gewinn je {STAKE:.0f} $ – sofort zum echten Orderbuch-Preis", s["pnl_sofort"][0], f'{s["pnl_sofort"][1]} Trades'],
+            [f"Gewinn je {STAKE:.0f} $ – Einstieg sobald handelbar", s["pnl_handelbar"][0], f'{s["pnl_handelbar"][1]} Trades'],
+            ["Offene Märkte: Preis bewegt sich Richtung Exa",
+             f'{s["richtung_ok"]} von {s["richtung_n"]} ({pct(s["richtung_ok"], s["richtung_n"])})'],
+            [],
+        ])
+
+    block(f"Gesamt (Stand {now.strftime('%d.%m.%Y %H:%M')})", rows)
+    block(f"Laufender Monat {cur}", [r for r in rows if r["erfasst"].startswith(cur)])
+    block(f"Vormonat {prev}", [r for r in rows if r["erfasst"].startswith(prev)])
+    bold.append(len(a_rows))
+    a_rows.append(["Kalibrierung: Wenn Exa X % sagt – wie oft tritt es wirklich ein?"])
+    bold.append(len(a_rows))
+    a_rows.append(["Exa-Bereich", "Anzahl", "Ø Exa %", "Tatsächlich %", "Ø Markt %"])
+    a_rows.extend(calibration(rows))
+    a_rows.append([])
+    bold.append(len(a_rows))
+    a_rows.append(["Erklärung"])
+    for t in [
+        "Delta = Exa-Wahrscheinlichkeit minus Marktpreis bei Erfassung (Prozentpunkte). Positiv = Exa hält die Antwort für wahrscheinlicher als der Markt.",
+        "Exa näher am Ergebnis: Nach Auflösung (100 % oder 0 %) – war Exas Zahl näher dran als der Marktpreis?",
+        "Brier-Score: mittlerer quadratischer Fehler der Wahrscheinlichkeiten. 0 = perfekt, 0,25 = Münzwurf. Exa sollte unter dem Markt liegen.",
+        f"Gewinn: je {STAKE:.0f} $ in Exas Richtung (Ja wenn Delta > 0, Nein wenn Delta < 0), gezählt nach Auflösung. "
+        "Theoretisch = zum Mittelpreis bei Erfassung. Sofort = echter Durchschnittspreis aus dem Orderbuch "
+        f"(nur Stufen bis {orderbook.FILL_WINDOW:.0f} ¢ über dem besten Ask; reicht die Tiefe nicht, zählt nur der gefüllte Betrag). "
+        "Ab handelbar = Einstieg am ersten Tag mit Spread ≤ "
+        f"{orderbook.MAX_SPREAD:.0f} ¢ und voller Füllung.",
+        "Edge nach Einstieg = Exa-Wahrscheinlichkeit (in Exas Richtung) minus echter Einstiegspreis. Positiv = auch nach Spread noch Vorteil.",
+        "Wert bei Verkauf jetzt = was der Sofort-Trade heute beim Verkauf zum besten Bid bringen würde (vor Auflösung).",
+        "Kalibrierung: Bei guter Kalibrierung liegt 'Tatsächlich %' nahe an 'Ø Exa %'.",
+    ]:
+        a_rows.append([t])
+    auswertung = {"title": "Auswertung", "header": None, "rows": a_rows,
+                  "widths": [60, 18, 12, 14, 12], "bold_rows": bold, "wrap_cols": [0]}
+    return [maerkte, verlauf, auswertung]
+
+
+# ---------------------------------------------------------------- Excel (Ersatz ohne Google)
+
+def build_excel(tabs):
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    head_fill, head_font = PatternFill("solid", fgColor="0B5F3A"), Font(color="FFFFFF", bold=True)
+    green, red = PatternFill("solid", fgColor="D9F2E3"), PatternFill("solid", fgColor="F8D7DA")
+    wb = Workbook()
+    wb.remove(wb.active)
+    for t in tabs:
+        ws = wb.create_sheet(t["title"])
+        hdr = 1 if t.get("header") else 0
+        if hdr:
+            ws.append(t["header"])
+        for row in t["rows"]:
+            ws.append(row)
+        for i, w in enumerate(t.get("widths") or [], 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        n, ncols = ws.max_row, ws.max_column
+        if hdr:
+            for c in range(1, ncols + 1):
+                cell = ws.cell(row=1, column=c)
+                cell.fill, cell.font = head_fill, head_font
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{n}"
+        for c, fmt in (t.get("num_cols") or {}).items():
+            for r in range(hdr + 1, n + 1):
+                ws.cell(row=r, column=c + 1).number_format = fmt.replace('" $"', ' $')
+        for c in t.get("wrap_cols") or []:
+            for r in range(hdr + 1, n + 1):
+                ws.cell(row=r, column=c + 1).alignment = Alignment(wrap_text=True, vertical="top")
+        for r in t.get("bold_rows") or []:
+            for c in range(1, ncols + 1):
+                ws.cell(row=hdr + r + 1, column=c).font = Font(bold=True, size=12)
+        if n > hdr:
+            for c in t.get("posneg_cols") or []:
+                rng = f"{get_column_letter(c + 1)}{hdr + 1}:{get_column_letter(c + 1)}{n}"
+                ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["0"], fill=green))
+                ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=red))
+            for c in t.get("yesno_cols") or []:
+                rng = f"{get_column_letter(c + 1)}{hdr + 1}:{get_column_letter(c + 1)}{n}"
+                ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"ja"'], fill=green))
+                ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"nein"'], fill=red))
+        lc = t.get("link_col")
+        if lc is not None:
+            for i, url in enumerate(t.get("links") or []):
+                if url:
+                    cell = ws.cell(row=hdr + i + 1, column=lc + 1)
+                    cell.hyperlink = url
+                    cell.font = Font(color="0B5FFF", underline="single")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- Telegram
+
+def send(text):
+    if not TOKEN or not CHAT_ID:
+        print(text)
+        return
+    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": "true"}, timeout=30)
+    if r.status_code != 200:
+        print("Telegram-Fehler:", r.status_code, r.text[:300])
+
+
+def send_document(filename, content, caption=""):
+    if not TOKEN or not CHAT_ID:
+        with open(filename, "wb") as f:
+            f.write(content)
+        print("Datei gespeichert:", filename)
+        return
+    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument",
+                      data={"chat_id": CHAT_ID, "caption": caption},
+                      files={"document": (filename, content,
+                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                      timeout=60)
+    if r.status_code != 200:
+        print("Telegram-Fehler:", r.status_code, r.text[:300])
+
+
+def fmt_stats(s):
+    lines = [f"Märkte: {s['maerkte']} · mit Exa: {s['mit_exa']} · aufgelöst: {s['aufgeloest']}"]
+    if s["signale_alle"]:
+        lines.append(f"Signale: {s['signale_alle']} · handelbar bei Erfassung: {s['handelbar_bei_erfassung']}"
+                     f" · später handelbar: {s['spaeter_handelbar']}")
+    if s["aufgeloest"]:
+        lines.append(f"Exa näher am Ergebnis: <b>{s['exa_naeher']}/{s['aufgeloest']}</b> ({pct(s['exa_naeher'], s['aufgeloest'])})")
+        lines.append(f"Brier Exa {s['brier_exa']:.3f} vs. Markt {s['brier_markt']:.3f} (kleiner = besser)")
+    if s["signale"]:
+        lines.append(f"Signale ≥{SIGNAL_MIN_DELTA:.0f} PP richtig: <b>{s['treffer']}/{s['signale']}</b> ({pct(s['treffer'], s['signale'])})")
+    for key, label in (("pnl_mitte", "theoretisch"), ("pnl_sofort", "sofort (Orderbuch)"),
+                       ("pnl_handelbar", "ab handelbar")):
+        v, n = s[key]
+        if n:
+            lines.append(f"Gewinn {label}: <b>{v:+.2f} $</b> ({n} × {STAKE:.0f} $)")
+    if s["richtung_n"]:
+        lines.append(f"Offene Märkte bewegen sich Richtung Exa: {s['richtung_ok']}/{s['richtung_n']} ({pct(s['richtung_ok'], s['richtung_n'])})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- Ablauf
+
+def sync_sheet():
+    """Nur das Google Sheet neu schreiben (fuer new_markets.py). Kein Telegram, kein Schnappschuss."""
+    if not gsheet.enabled():
+        return
+    log = read_csv(LOG_FILE)
+    if not log:
+        return
+    markets = fetch_markets(x.get("market_id") for x in log)
+    snaps = read_csv(SNAP_FILE)
+    rows = build_rows(log, markets, snaps)
+    gsheet.write_tables(tables(rows, snaps, datetime.now(TZ)))
+    print(f"Google Sheet aktualisiert ({len(rows)} Märkte)")
+
+
+def main():
+    if os.environ.get("GITHUB_ACTIONS") and (not TOKEN or not CHAT_ID):
+        raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+
+    log = read_csv(LOG_FILE)
+    if not log:
+        send("📊 <b>Exa-Tracking</b>\nNoch keine Märkte protokolliert – der Neue-Märkte-Alarm füllt das Protokoll automatisch.")
+        return
+
+    markets = fetch_markets(x.get("market_id") for x in log)
+    snaps, n_new = save_snapshot(markets, read_csv(SNAP_FILE), today)
+    rows = build_rows(log, markets, snaps)
+    tabs = tables(rows, snaps, now)
+
+    sheet_ok = False
+    if gsheet.enabled():
+        try:
+            gsheet.write_tables(tabs)
+            sheet_ok = True
+        except Exception as ex:  # Sheet-Fehler soll den Bericht nicht verhindern
+            print("Google-Sheet-Fehler:", ex)
+
+    cur, prev = months(now)
+    if MODE == "monthly":
+        text = (f"📈 <b>Monatliches Exa-Feedback – {prev}</b>\n\n"
+                f"<b>Märkte aus {prev}:</b>\n{fmt_stats(stats([r for r in rows if r['erfasst'].startswith(prev)]))}\n\n"
+                f"<b>Gesamt seit Start:</b>\n{fmt_stats(stats(rows))}")
+    else:
+        moved = sorted((r for r in rows if r["bewegung"] is not None and r["status"] == "offen"),
+                       key=lambda r: -abs(r["bewegung"]))[:5]
+        top = "\n".join(
+            f"{'📈' if r['bewegung'] > 0 else '📉'} {escape(r['event'][:60])} – {escape(r['antwort'][:20])}: "
+            f"{r['markt']:.0f}% → {r['jetzt']:.0f}%"
+            + (f" (Exa {r['exa']:.0f}%, {'✅ Richtung Exa' if r['richtung_exa'] else '❌ gegen Exa'})"
+               if r["exa"] is not None and r["richtung_exa"] is not None else "")
+            for r in moved if abs(r["bewegung"]) >= 3)
+        text = (f"📊 <b>Exa-Tracking – {now.strftime('%d.%m.%Y')}</b>\n\n{fmt_stats(stats(rows))}"
+                + (f"\n\n<b>Größte Bewegungen (offene Märkte):</b>\n{top}" if top else ""))
+    if sheet_ok:
+        text += f'\n\n📄 <a href="{gsheet.sheet_url()}">Google Sheet öffnen</a>'
+    send(text)
+    if not sheet_ok:
+        send_document(f"exa_tracking_{today}.xlsx", build_excel(tabs), "📊 Exa-Tracking – in Excel öffnen")
+    print(f"{len(rows)} Märkte, {n_new} neue Schnappschüsse, Modus {MODE}, Sheet {'ok' if sheet_ok else 'aus'}")
+
+
+if __name__ == "__main__":
+    main()
