@@ -5,8 +5,11 @@ on:
     - cron: "27 * * * *"   # stündlich zur Minute 27
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
-  group: new-markets
+  group: polymarket-data
   cancel-in-progress: false
 
 jobs:
@@ -41,3 +44,16 @@ jobs:
           NEW_ESPORTS_MIN_VOLUME: ${{ vars.NEW_ESPORTS_MIN_VOLUME }}
           NEW_ESPORTS_MAX_AGE_HOURS: ${{ vars.NEW_ESPORTS_MAX_AGE_HOURS }}
         run: python new_markets.py
+
+      - name: Protokoll speichern
+        run: |
+          if [ -d data ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898315+github-actions[bot]@users.noreply.github.com"
+            git add data/
+            if ! git diff --cached --quiet; then
+              git commit -m "Exa-Protokoll aktualisiert"
+              git pull --rebase
+              git push
+            fi
+          fi
