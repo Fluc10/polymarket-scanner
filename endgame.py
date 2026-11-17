@@ -19,7 +19,9 @@ Dateien (vom Workflow committed):
   data/endgame_results.csv   - Ergebnisse nach Ablauf
   data/endgame_log.csv       - Exa-Analysen inkl. Orderbuch und Edge
   data/endgame_state.json    - wann welcher Markt zuletzt analysiert wurde
-Google Sheet: Blaetter "Endspurt" und "Endspurt-Statistik".
+Google Sheet: Blaetter "Endspurt-Märkte" (alle aktuellen Maerkte im Fenster),
+"Endspurt-Statistik" und - falls Exa an ist - "Endspurt" (Exa-Analysen).
+Telegram: Zusammenfassung + neue Maerkte seit dem letzten Lauf + HTML-Datei mit allen Maerkten.
 """
 import json
 import os
@@ -49,7 +51,7 @@ MAX_DAYS = env("ENDGAME_MAX_DAYS", 7)
 MIN_VOLUME = env("ENDGAME_MIN_VOLUME", 2000)
 P_LOW = env("ENDGAME_P_LOW", 15)
 P_HIGH = env("ENDGAME_P_HIGH", 85)
-EXA_MAX = int(env("ENDGAME_EXA_MAX", 15))          # Maerkte pro Lauf mit Exa-Pruefung
+EXA_MAX = int(env("ENDGAME_EXA_MAX", 0))           # Maerkte pro Lauf mit Exa-Pruefung (0 = aus)
 REEVAL_PP = env("ENDGAME_REEVAL_PP", 10)            # neu pruefen, wenn Preis so stark bewegt
 REEVAL_HOURS = env("ENDGAME_REEVAL_HOURS", 12)
 MIN_EDGE = env("COMP_MIN_EDGE", 10)
@@ -453,7 +455,3 @@ def sheet_tabs(log, markets_now, prices, results, now):
     srows.extend(matrix_rows(pts))
     srows.append([])
     bold.append(len(srows))
-    srows.append(["Details"])
-    bold.append(len(srows))
-    srows.append(["Zeitpunkt vor Ablauf", "Favoritenpreis", "Anzahl Märkte", "Ø Preis %",
-                  "Tatsächlich gewonnen %", "Diff
