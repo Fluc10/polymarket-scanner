@@ -1,0 +1,38 @@
+name: Trading Competition
+
+on:
+  schedule:
+    # Täglich 06:33 UTC (= 07:33 Wien im Winter), nach dem Exa-Tracking (06:13 UTC),
+    # damit die Tages-Schnappschüsse mit den aktuellen Bid-Preisen schon da sind.
+    - cron: "33 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: polymarket-data
+  cancel-in-progress: false
+
+jobs:
+  competition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Rangliste berechnen
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          COMP_MIN_EDGE: ${{ vars.COMP_MIN_EDGE || '10' }}
+        run: python competition.py
