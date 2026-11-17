@@ -245,8 +245,82 @@ def build_rows(log, markets, snaps):
             "nachrichten": x.get("nachrichtenlage", ""), "begruendung": x.get("begruendung", ""),
             "quellen": x.get("quellen", ""), "market_id": mid,
         }
+        r.update(pro_fields(x, o, mkt, exa))
         rows.append(r)
     return rows
+
+
+def pro_fields(x, o, mkt, exa):
+    """Vergleichsmodell (z. B. exa-pro) auf derselben Antwort."""
+    pro, dpro = num(x.get("exa_pro_prozent")), num(x.get("delta_pro_pp"))
+    side = x.get("richtung_pro") or ("ja" if (dpro or 0) > 0 else "nein" if (dpro or 0) < 0 else "")
+    won = None if o is None or not side else (o if side == "ja" else 1 - o)
+    is_signal = dpro is not None and abs(dpro) >= SIGNAL_MIN_DELTA and side
+    mid_price = None if mkt is None or not side else (mkt if side == "ja" else 100 - mkt)
+    entry = num(x.get(f"einstieg_{side}")) if side else None
+    filled = num(x.get(f"gefuellt_{side}")) if side else None
+    stake_now = min(STAKE, filled) if filled else None
+    side_main = x.get("richtung") or ""
+    einig = None
+    if side and side_main and pro is not None and exa is not None:
+        einig = side == side_main
+    pro_better = None
+    if o is not None and pro is not None and exa is not None and abs(pro - exa) >= 0.5:
+        pro_better = abs(o * 100 - pro) < abs(o * 100 - exa)
+    return {
+        "modell": x.get("modell", ""), "modell_pro": x.get("modell_pro", ""),
+        "exa_pro": pro, "delta_pro": dpro,
+        "signal_pro": SIGNAL_TEXT.get(x.get("signal_pro", ""), x.get("signal_pro", "")),
+        "begruendung_pro": x.get("begruendung_pro", ""),
+        "richtung_pro": {"ja": "Ja", "nein": "Nein"}.get(side, ""),
+        "edge_pro": num(x.get("edge_pro_pp")), "einig": einig, "pro_besser": pro_better,
+        "won_pro": won, "signal_pro_ok": bool(is_signal),
+        "pnl_mitte_pro": pnl(STAKE, mid_price, won) if is_signal else None,
+        "pnl_sofort_pro": pnl(stake_now, entry, won) if is_signal else None,
+        "kosten_exa": num(x.get("kosten_exa")), "kosten_pro": num(x.get("kosten_pro")),
+    }
+
+
+def compare_stats(rows):
+    """Exa (Hauptmodell) gegen Vergleichsmodell auf denselben Maerkten."""
+    both = [r for r in rows if r["exa"] is not None and r.get("exa_pro") is not None]
+    res = [r for r in both if r["ergebnis"] is not None]
+    decided = [r for r in res if r.get("pro_besser") is not None]
+
+    def hits(rs, key_delta):
+        sig = [r for r in rs if r.get(key_delta) is not None and abs(r[key_delta]) >= SIGNAL_MIN_DELTA]
+        ok = [r for r in sig if (r[key_delta] > 0) == (r["ergebnis"] == 1)]
+        return len(ok), len(sig)
+
+    def total(key, rs=rows):
+        v = [r[key] for r in rs if r.get(key) is not None]
+        return (round(sum(v), 2), len(v))
+
+    agree = [r for r in rows if r.get("einig") and r.get("signal_pro_ok")]
+    agree_res = [r for r in agree if r["ergebnis"] is not None]
+    model_main = next((r["modell"] for r in rows if r.get("modell")), "exa")
+    model_pro = next((r["modell_pro"] for r in rows if r.get("modell_pro")), "")
+    return {
+        "modell": model_main, "modell_pro": model_pro,
+        "beide": len(both), "aufgeloest": len(res),
+        "brier_exa": sum(brier(r["exa"], r["ergebnis"]) for r in res) / len(res) if res else None,
+        "brier_pro": sum(brier(r["exa_pro"], r["ergebnis"]) for r in res) / len(res) if res else None,
+        "pro_naeher": sum(1 for r in decided if r["pro_besser"]), "entschieden": len(decided),
+        "treffer_exa": hits(res, "delta"), "treffer_pro": hits(res, "delta_pro"),
+        "einig_n": len([r for r in both if r.get("einig") is not None]),
+        "einig_ja": sum(1 for r in both if r.get("einig")),
+        "einig_signale": len(agree), "einig_treffer": sum(1 for r in agree_res if r["won_pro"] == 1),
+        "einig_aufgeloest": len(agree_res),
+        "pnl_mitte_exa": total("pnl_mitte", both), "pnl_sofort_exa": total("pnl_sofort", both),
+        "pnl_mitte_pro": total("pnl_mitte_pro", both), "pnl_sofort_pro": total("pnl_sofort_pro", both),
+        "pnl_einig": total("pnl_sofort_pro", agree),
+        "kosten_exa": total("kosten_exa"), "kosten_pro": total("kosten_pro"),
+    }
+
+
+def label(model):
+    return {"exa": "Exa", "exa-pro": "Exa Pro", "exa-fast": "Exa Fast",
+            "exa-research": "Exa Research"}.get(model or "", model or "Exa")
 
 
 def _ba(bid, ask):
@@ -336,33 +410,42 @@ def tables(rows, snaps, now):
                    "Status", "Exa näher am Ergebnis?",
                    f"Gewinn {T} theoretisch (Mitte)", f"Gewinn {T} sofort (Orderbuch)",
                    f"Gewinn {T} ab handelbar",
-                   "Nachrichtenlage (Exa)", "Begründung (Exa)", "Quellen"],
+                   "Exa Pro %", "Delta Pro (Pro−Markt) PP", "Signal Pro", "Richtung Pro",
+                   "Modelle einig?", "Edge Pro nach Einstieg PP", "Pro näher als Exa?",
+                   f"Gewinn Pro {T} theoretisch", f"Gewinn Pro {T} sofort",
+                   "Nachrichtenlage (Exa)", "Begründung (Exa)", "Begründung (Exa Pro)", "Quellen"],
         "rows": [[r["erfasst"], r["art"], r["event"], r["antwort"], r["ende"], r["markt"], r["exa"],
                   r["delta"], r["signal"], r["richtung"], r["ja_ba"], r["nein_ba"], r["spread"],
                   r["einstieg"], r["gefuellt"], r["edge"], r["handelbar"], r["handelbar_seit"],
                   r1(r["jetzt"]), r["bewegung"], yn(r["richtung_exa"]), r["ausstieg"], r["mtm"],
                   r["status"], yn(r["exa_besser"]), r["pnl_mitte"], r["pnl_sofort"], r["pnl_handelbar"],
-                  r["nachrichten"], r["begruendung"], r["quellen"]] for r in rows],
+                  r["exa_pro"], r["delta_pro"], r["signal_pro"], r["richtung_pro"], yn(r["einig"]),
+                  r["edge_pro"], yn(r["pro_besser"]), r["pnl_mitte_pro"], r["pnl_sofort_pro"],
+                  r["nachrichten"], r["begruendung"], r["begruendung_pro"], r["quellen"]] for r in rows],
         "widths": [16, 10, 48, 22, 11, 11, 9, 11, 14, 9, 11, 11, 9, 13, 10, 11, 22, 20,
-                   10, 12, 12, 10, 13, 15, 12, 13, 13, 13, 60, 50, 40],
+                   10, 12, 12, 10, 13, 15, 12, 13, 13, 13,
+                   9, 11, 14, 9, 10, 11, 11, 13, 13, 60, 50, 50, 40],
         "link_col": 2, "links": links,
         "num_cols": {5: "0.0", 6: "0.0", 7: "+0.0;-0.0;0.0", 12: "0.0", 13: "0.0", 14: "0.00",
                      15: "+0.0;-0.0;0.0", 18: "0.0", 19: "+0.0;-0.0;0.0", 21: "0.0",
                      22: '+0.00" $";-0.00" $";0.00" $"', 25: '+0.00" $";-0.00" $";0.00" $"',
-                     26: '+0.00" $";-0.00" $";0.00" $"', 27: '+0.00" $";-0.00" $";0.00" $"'},
-        "posneg_cols": [7, 15, 19, 22, 25, 26, 27], "yesno_cols": [16, 20, 24], "wrap_cols": [28, 29, 30],
+                     26: '+0.00" $";-0.00" $";0.00" $"', 27: '+0.00" $";-0.00" $";0.00" $"',
+                     28: "0.0", 29: "+0.0;-0.0;0.0", 33: "+0.0;-0.0;0.0",
+                     35: '+0.00" $";-0.00" $";0.00" $"', 36: '+0.00" $";-0.00" $";0.00" $"'},
+        "posneg_cols": [7, 15, 19, 22, 25, 26, 27, 29, 33, 35, 36], "yesno_cols": [16, 20, 24, 32, 34],
+        "wrap_cols": [37, 38, 39, 40],
     }
 
     dates = sorted({s["datum"] for s in snaps})
     by = {(s["market_id"], s["datum"]): num(s["prozent"]) for s in snaps}
     verlauf = {
         "title": "Verlauf",
-        "header": ["Event", "Antwort", "Exa %", "Markt bei Erfassung %"] + dates,
-        "rows": [[r["event"], r["antwort"], r["exa"], r["markt"]] +
+        "header": ["Event", "Antwort", "Exa %", "Exa Pro %", "Markt bei Erfassung %"] + dates,
+        "rows": [[r["event"], r["antwort"], r["exa"], r["exa_pro"], r["markt"]] +
                  [by.get((r["market_id"], d)) for d in dates] for r in rows],
-        "widths": [48, 22, 9, 11] + [10] * len(dates),
+        "widths": [48, 22, 9, 9, 11] + [10] * len(dates),
         "link_col": 0, "links": links,
-        "num_cols": {c: "0.0" for c in range(2, 4 + len(dates))},
+        "num_cols": {c: "0.0" for c in range(2, 5 + len(dates))},
     }
 
     cur, prev = months(now)
@@ -396,6 +479,40 @@ def tables(rows, snaps, now):
     block(f"Gesamt (Stand {now.strftime('%d.%m.%Y %H:%M')})", rows)
     block(f"Laufender Monat {cur}", [r for r in rows if r["erfasst"].startswith(cur)])
     block(f"Vormonat {prev}", [r for r in rows if r["erfasst"].startswith(prev)])
+
+    c = compare_stats(rows)
+    if c["beide"]:
+        A, B = label(c["modell"]), label(c["modell_pro"])
+        bold.append(len(a_rows))
+        a_rows.append([f"Modellvergleich: {A} gegen {B} (gleiche Märkte, gleiche Antwort)"])
+        bold.append(len(a_rows))
+        a_rows.append(["Kennzahl", A, B])
+        a_rows.extend([
+            ["Märkte mit beiden Einschätzungen", c["beide"], c["beide"]],
+            ["davon aufgelöst", c["aufgeloest"], c["aufgeloest"]],
+            ["Brier-Score (kleiner = besser)",
+             r1(c["brier_exa"], 4) if c["brier_exa"] is not None else "–",
+             r1(c["brier_pro"], 4) if c["brier_pro"] is not None else "–"],
+            ["Näher am Ergebnis (Kopf-an-Kopf)",
+             c["entschieden"] - c["pro_naeher"], c["pro_naeher"]],
+            [f"Signale ≥ {SIGNAL_MIN_DELTA:.0f} PP richtig",
+             f'{c["treffer_exa"][0]} von {c["treffer_exa"][1]} ({pct(*c["treffer_exa"])})',
+             f'{c["treffer_pro"][0]} von {c["treffer_pro"][1]} ({pct(*c["treffer_pro"])})'],
+            [f"Gewinn je {STAKE:.0f} $ theoretisch", c["pnl_mitte_exa"][0], c["pnl_mitte_pro"][0]],
+            [f"Gewinn je {STAKE:.0f} $ sofort (Orderbuch)", c["pnl_sofort_exa"][0], c["pnl_sofort_pro"][0]],
+            ["Anzahl Trades (sofort)", c["pnl_sofort_exa"][1], c["pnl_sofort_pro"][1]],
+            ["Exa-Kosten gesamt $", c["kosten_exa"][0], c["kosten_pro"][0]],
+            ["Kosten pro Analyse $",
+             round(c["kosten_exa"][0] / c["kosten_exa"][1], 4) if c["kosten_exa"][1] else "–",
+             round(c["kosten_pro"][0] / c["kosten_pro"][1], 4) if c["kosten_pro"][1] else "–"],
+            [],
+            ["Beide Modelle in dieselbe Richtung", f'{c["einig_ja"]} von {c["einig_n"]} ({pct(c["einig_ja"], c["einig_n"])})'],
+            [f"Gemeinsame Signale (beide ≥ {SIGNAL_MIN_DELTA:.0f} PP, gleiche Richtung)", c["einig_signale"]],
+            ["… davon aufgelöst und richtig",
+             f'{c["einig_treffer"]} von {c["einig_aufgeloest"]} ({pct(c["einig_treffer"], c["einig_aufgeloest"])})'],
+            [f"… Gewinn je {STAKE:.0f} $ sofort", c["pnl_einig"][0], f'{c["pnl_einig"][1]} Trades'],
+            [],
+        ])
     bold.append(len(a_rows))
     a_rows.append(["Kalibrierung: Wenn Exa X % sagt – wie oft tritt es wirklich ein?"])
     bold.append(len(a_rows))
@@ -416,6 +533,9 @@ def tables(rows, snaps, now):
         "Edge nach Einstieg = Exa-Wahrscheinlichkeit (in Exas Richtung) minus echter Einstiegspreis. Positiv = auch nach Spread noch Vorteil.",
         "Wert bei Verkauf jetzt = was der Sofort-Trade heute beim Verkauf zum besten Bid bringen würde (vor Auflösung).",
         "Kalibrierung: Bei guter Kalibrierung liegt 'Tatsächlich %' nahe an 'Ø Exa %'.",
+        "Modellvergleich: Das Hauptmodell wählt die Antwort, das Vergleichsmodell (z. B. Exa Pro) bewertet genau dieselbe Antwort. "
+        "Kopf-an-Kopf zählt nur Märkte, bei denen sich die beiden um mindestens 0,5 PP unterscheiden. "
+        "Gemeinsame Signale = beide Modelle sehen ≥ Schwelle Abstand in dieselbe Richtung – oft das stärkste Signal.",
     ]:
         a_rows.append([t])
     auswertung = {"title": "Auswertung", "header": None, "rows": a_rows,
@@ -530,6 +650,27 @@ def fmt_stats(s):
     return "\n".join(lines)
 
 
+def fmt_compare(c):
+    if not c["beide"]:
+        return ""
+    A, B = label(c["modell"]), label(c["modell_pro"])
+    lines = [f"<b>{A} vs. {B}</b> ({c['beide']} Märkte, {c['aufgeloest']} aufgelöst)",
+             f"Gleiche Richtung: {c['einig_ja']}/{c['einig_n']} · gemeinsame Signale: {c['einig_signale']}"]
+    if c["aufgeloest"]:
+        lines.append(f"Brier {A} {c['brier_exa']:.3f} vs. {B} {c['brier_pro']:.3f} (kleiner = besser)")
+    if c["entschieden"]:
+        lines.append(f"Näher am Ergebnis: {A} {c['entschieden'] - c['pro_naeher']} · {B} {c['pro_naeher']}")
+    for k, lab in (("treffer_exa", A), ("treffer_pro", B)):
+        if c[k][1]:
+            lines.append(f"Signale richtig {lab}: {c[k][0]}/{c[k][1]} ({pct(*c[k])})")
+    if c["pnl_sofort_exa"][1] or c["pnl_sofort_pro"][1]:
+        lines.append(f"Gewinn sofort: {A} {c['pnl_sofort_exa'][0]:+.2f} $ · {B} {c['pnl_sofort_pro'][0]:+.2f} $"
+                     + (f" · beide einig {c['pnl_einig'][0]:+.2f} $" if c["pnl_einig"][1] else ""))
+    if c["kosten_exa"][1] or c["kosten_pro"][1]:
+        lines.append(f"Kosten: {A} {c['kosten_exa'][0]:.2f} $ · {B} {c['kosten_pro'][0]:.2f} $")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- Ablauf
 
 def sync_sheet():
@@ -575,6 +716,9 @@ def main():
         text = (f"📈 <b>Monatliches Exa-Feedback – {prev}</b>\n\n"
                 f"<b>Märkte aus {prev}:</b>\n{fmt_stats(stats([r for r in rows if r['erfasst'].startswith(prev)]))}\n\n"
                 f"<b>Gesamt seit Start:</b>\n{fmt_stats(stats(rows))}")
+        cmp_text = fmt_compare(compare_stats(rows))
+        if cmp_text:
+            text += "\n\n" + cmp_text
     else:
         moved = sorted((r for r in rows if r["bewegung"] is not None and r["status"] == "offen"),
                        key=lambda r: -abs(r["bewegung"]))[:5]
@@ -584,7 +728,9 @@ def main():
             + (f" (Exa {r['exa']:.0f}%, {'✅ Richtung Exa' if r['richtung_exa'] else '❌ gegen Exa'})"
                if r["exa"] is not None and r["richtung_exa"] is not None else "")
             for r in moved if abs(r["bewegung"]) >= 3)
+        cmp_text = fmt_compare(compare_stats(rows))
         text = (f"📊 <b>Exa-Tracking – {now.strftime('%d.%m.%Y')}</b>\n\n{fmt_stats(stats(rows))}"
+                + (f"\n\n{cmp_text}" if cmp_text else "")
                 + (f"\n\n<b>Größte Bewegungen (offene Märkte):</b>\n{top}" if top else ""))
     if sheet_ok:
         text += f'\n\n📄 <a href="{gsheet.sheet_url()}">Google Sheet öffnen</a>'
