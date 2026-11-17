@@ -55,7 +55,11 @@ STAKE = orderbook.TRADE_SIZE
 FS_FIELDS = ["geprueft_am", "market_id", "event", "event_slug", "antwort", "frage", "erfasst_am",
              "markt_bei_erfassung", "exa_prozent", "exa_pro_prozent", "delta_pp", "markt_bei_check",
              "fs_prozent", "fs_delta_pp", "fs_richtung", "einig_mit_exa", "begruendung",
-             "kosten_ca", "effort"]
+             "kosten_ca", "effort",
+             # Orderbuch beim Check (Cent) - fuer die Trading Competition
+             "ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
+             "einstieg_nein", "gefuellt_nein"]
+COMP_MIN_EDGE = env_float("COMP_MIN_EDGE", 10)
 
 
 # ---------------------------------------------------------------- Hilfen
@@ -196,6 +200,27 @@ def is_balance_error(ex):
     return "insufficient" in text or "balance" in text or "402" in text
 
 
+def comp_line(prob, book):
+    """Telegram-Zeile: wuerde FutureSearch in der Trading Competition handeln?"""
+    if prob is None:
+        return "🏁 Competition: kein Trade (keine Wahrscheinlichkeit)"
+    best = None
+    for side, fair in (("ja", prob), ("nein", 100 - prob)):
+        entry, filled = book.get(f"einstieg_{side}"), book.get(f"gefuellt_{side}")
+        if entry is None or not filled:
+            continue
+        edge = fair - entry
+        if best is None or edge > best[1]:
+            best = (side, edge, entry, min(orderbook.TRADE_SIZE, filled))
+    if best is None:
+        return "🏁 Competition: kein Trade (kein Orderbuch)"
+    side, edge, entry, filled = best
+    if edge < COMP_MIN_EDGE:
+        return f"🏁 Competition: kein Trade (Edge {edge:+.1f} ¢ < {COMP_MIN_EDGE:.0f} ¢)"
+    return (f"🏁 Competition-Trade: {'Ja' if side == 'ja' else 'Nein'} @ {entry:.1f}¢ "
+            f"für {filled:.0f} $ (Edge +{edge:.1f} ¢)")
+
+
 # ---------------------------------------------------------------- Google Sheet
 
 def sheet_table(fs_rows, markets):
@@ -250,183 +275,4 @@ def write_sheet(fs_rows):
         import gsheet
         markets = {}
         for x in fs_rows:
-            mid = str(x.get("market_id"))
-            if mid and mid not in markets:
-                m = get_json(f"{GAMMA}/markets/{mid}")
-                if isinstance(m, dict):
-                    markets[mid] = m
-        gsheet.write_tables([sheet_table(fs_rows, markets)])
-        # Blatt hinter "Märkte", "Verlauf", "Auswertung" einsortieren
-        sh = gsheet._open()
-        ws = sh.worksheet("FutureSearch")
-        sh.batch_update({"requests": [{"updateSheetProperties": {
-            "properties": {"sheetId": ws.id, "index": 3}, "fields": "index"}}]})
-        return gsheet.sheet_url()
-    except Exception as ex:
-        print("Google-Sheet-Fehler:", ex)
-        return ""
-
-
-# ---------------------------------------------------------------- Auswertung
-
-def summary(fs_rows):
-    res = []
-    for x in fs_rows:
-        m = get_json(f"{GAMMA}/markets/{x.get('market_id')}")
-        o = outcome_of(m) if isinstance(m, dict) else None
-        if o is not None:
-            res.append((x, o))
-    if not res:
-        return f"Bisher {len(fs_rows)} Märkte geprüft, noch keiner aufgelöst."
-
-    def brier(key):
-        v = [(num(x.get(key)) / 100 - o) ** 2 for x, o in res if num(x.get(key)) is not None]
-        return (sum(v) / len(v), len(v)) if v else (None, 0)
-
-    parts = []
-    for key, name in (("markt_bei_check", "Markt"), ("exa_prozent", "Exa"),
-                      ("exa_pro_prozent", "Exa Pro"), ("fs_prozent", "FutureSearch")):
-        b, n = brier(key)
-        if b is not None:
-            parts.append(f"{name} {b:.3f}")
-    return (f"Bisher {len(fs_rows)} geprüft, {len(res)} aufgelöst. Brier (kleiner = besser): "
-            + " · ".join(parts))
-
-
-# ---------------------------------------------------------------- Ablauf
-
-def main():
-    if os.environ.get("GITHUB_ACTIONS") and (not TOKEN or not CHAT_ID):
-        raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
-    now = datetime.now(TZ)
-    today = now.strftime("%Y-%m-%d")
-    state = load_state()
-
-    # Zeitfenster: einmal pro Tag ab FS_RUN_HOUR (Wien) - manuell mit FS_FORCE jederzeit
-    if not FS_FORCE:
-        if now.hour < FS_RUN_HOUR:
-            print(f"Noch nicht {FS_RUN_HOUR} Uhr in Wien ({now:%H:%M}) – nichts zu tun.")
-            return
-        if state.get("last_run") == today:
-            print("Heute schon gelaufen.")
-            return
-
-    if not FS_KEY:
-        send("🔮 <b>FutureSearch-Check</b>\n⚠️ Secret <code>FUTURESEARCH_API_KEY</code> fehlt – bitte in GitHub anlegen.")
-        return
-
-    fs_log = read_csv(FS_FILE)
-    done = {str(x.get("market_id")) for x in fs_log}
-    cands = pick_candidates(read_csv(LOG_FILE), done, datetime.now(timezone.utc))
-
-    # Aktuellen Stand holen, geschlossene Maerkte ueberspringen
-    chosen = []
-    for x in cands:
-        m = get_json(f"{GAMMA}/markets/{x.get('market_id')}")
-        if not isinstance(m, dict) or m.get("closed") or yes_price(m) is None:
-            continue
-        chosen.append((x, m))
-        if len(chosen) >= FS_PER_DAY:
-            break
-
-    state["last_run"] = today
-    if not chosen:
-        save_state(state)
-        send(f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b>\nKeine neuen Märkte mit Exa-Delta in den letzten {FS_HOURS:.0f} h.")
-        return
-
-    before = balance_or_none()
-    if before is not None and before < 0.5:
-        save_state(state)
-        send(f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b>\n🚨 <b>Guthaben leer</b> ({before:.2f} $) – "
-             f"heute keine Prüfung. Aufladen: futuresearch.ai/app")
-        return
-
-    rows = []
-    for x, m in chosen:
-        p = yes_price(m) * 100
-        rows.append({
-            "question": build_question(x, m),
-            "resolution_criteria": (m.get("description") or "").strip()[:4000],
-            "resolution_date": (m.get("endDate") or "")[:10],
-            "market_creation_date": (m.get("createdAt") or "")[:10],
-            "market_price": f"{p:.1f}% Ja auf Polymarket (Stand {now:%Y-%m-%d %H:%M} Wien)",
-        })
-
-    try:
-        data = asyncio.run(fs_forecast(rows))
-    except Exception as ex:
-        if is_balance_error(ex):
-            save_state(state)
-            send(f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b>\n🚨 <b>Guthaben reicht nicht</b> für die Prüfung "
-                 f"({escape(str(ex)[:200])}). Aufladen: futuresearch.ai/app")
-        else:
-            send(f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b>\n❌ Fehler: {escape(str(ex)[:300])}")
-        raise
-
-    after = balance_or_none()
-    cost = None if before is None or after is None else max(before - after, 0)
-    per = None if cost is None else round(cost / len(chosen), 3)
-
-    new_rows, blocks = [], []
-    records = data.to_dict("records") if data is not None else []
-    by_q = {str(r.get("question")): r for r in records if r.get("question")}
-    for i, (x, m) in enumerate(chosen):
-        r = by_q.get(rows[i]["question"]) or (records[i] if i < len(records) else {})
-        fs_p = num(r.get("probability"))
-        mkt_c = round(yes_price(m) * 100, 1)
-        exa, pro, delta = num(x.get("exa_prozent")), num(x.get("exa_pro_prozent")), num(x.get("delta_pp"))
-        fs_d = None if fs_p is None else round(fs_p - mkt_c, 1)
-        fs_side = "" if fs_d is None or abs(fs_d) < 0.5 else ("ja" if fs_d > 0 else "nein")
-        exa_side = x.get("richtung") or ("ja" if (delta or 0) > 0 else "nein")
-        einig = "" if not fs_side else ("ja" if fs_side == exa_side else "nein")
-        reason = str(r.get("rationale") or "").strip()
-        new_rows.append({
-            "geprueft_am": now.strftime("%Y-%m-%d %H:%M"), "market_id": x.get("market_id"),
-            "event": x.get("event", ""), "event_slug": x.get("event_slug", ""),
-            "antwort": x.get("antwort", ""), "frage": rows[i]["question"],
-            "erfasst_am": x.get("erfasst_am", ""), "markt_bei_erfassung": x.get("markt_prozent", ""),
-            "exa_prozent": x.get("exa_prozent", ""), "exa_pro_prozent": x.get("exa_pro_prozent", ""),
-            "delta_pp": x.get("delta_pp", ""), "markt_bei_check": mkt_c,
-            "fs_prozent": "" if fs_p is None else fs_p, "fs_delta_pp": "" if fs_d is None else fs_d,
-            "fs_richtung": fs_side, "einig_mit_exa": einig, "begruendung": reason,
-            "kosten_ca": "" if per is None else per, "effort": FS_EFFORT,
-        })
-
-        link = f'<a href="https://polymarket.com/event/{x.get("event_slug", "")}">{escape(x.get("event", ""))}</a>'
-        ans = x.get("antwort") or "Ja"
-        line = [f"{link}" + (f" – <b>{escape(ans)}</b>" if ans != "Ja" else "")]
-        exa_txt = f"Exa {exa:.0f}%" if exa is not None else "Exa –"
-        if pro is not None:
-            exa_txt += f" · Exa Pro {pro:.0f}%"
-        line.append(f"   Markt jetzt {mkt_c:.0f}% · {exa_txt}")
-        if fs_p is None:
-            line.append("   ❔ FutureSearch: keine Wahrscheinlichkeit erhalten")
-        else:
-            icon = "🟢" if fs_d >= 5 else "🔴" if fs_d <= -5 else "⚪"
-            agree = {"ja": "🤝 einig mit Exa", "nein": "⚔️ gegen Exa"}.get(einig, "")
-            line.append(f"   {icon} <b>FutureSearch {fs_p:.0f}%</b> ({fs_d:+.0f} PP zum Markt) {agree}")
-        if reason:
-            line.append(f"   <i>{escape(reason[:450])}{'…' if len(reason) > 450 else ''}</i>")
-        blocks.append("\n".join(line))
-
-    orderbook.csv_append(FS_FILE, FS_FIELDS, new_rows)
-    save_state(state)
-    all_rows = fs_log + new_rows
-    url = write_sheet(all_rows)
-
-    text = (f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b> – Top {len(chosen)} Exa-Deltas der letzten "
-            f"{FS_HOURS:.0f} h\n\n" + "\n\n".join(blocks) + "\n\n" + summary(all_rows))
-    if after is not None:
-        text += f"\n💳 Guthaben: <b>{after:.2f} $</b>" + (f" (heute ca. {cost:.2f} $)" if cost is not None else "")
-        if after < FS_MIN_BALANCE:
-            left = f" – reicht nur noch für ca. {int(after / per)} Prüfungen" if per else ""
-            text += f"\n⚠️ <b>Guthaben knapp</b>{left}. Aufladen: futuresearch.ai/app"
-    if url:
-        text += f'\n📄 <a href="{url}">Google Sheet öffnen</a> (Blatt „FutureSearch“)'
-    send(text)
-    print(f"{len(chosen)} Märkte geprüft, Kosten ca. {cost}")
-
-
-if __name__ == "__main__":
-    main()
+            mid =
