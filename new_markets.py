@@ -5,7 +5,8 @@ Meldet per Telegram neue Events (erstellt in den letzten NEW_MAX_AGE_HOURS
 Stunden), sobald sie NEW_MIN_VOLUME Volumen erreichen.
 Sport, Krypto-Preise, Wetter und wiederkehrende Maerkte werden ignoriert.
 Zusaetzlich: neue Esports-Maerkte ohne Spielwetten (Roster, Transfers, Props).
-Jeder neue Markt wird mit Exa (/answer) analysiert: Nachrichtenlage, eigene
+Jeder neue Markt wird mit Exa (/answer) analysiert - Hauptmodell und Vergleichsmodell
+(EXA_MODELS, Standard "exa,exa-pro"): Nachrichtenlage, eigene
 Einschaetzung und Signal (unterbewertet / fair / ueberbewertet / unklar).
 Ergebnis: Telegram-Nachricht + eigene Datei neue_maerkte_*.html
 
@@ -54,6 +55,11 @@ ESPORTS_MIN_VOLUME = env_float("NEW_ESPORTS_MIN_VOLUME", 1000)
 ESPORTS_MAX_AGE_HOURS = env_float("NEW_ESPORTS_MAX_AGE_HOURS", 168)
 # Exa-Analyse: wie viele neue Maerkte pro Lauf maximal analysiert werden (Kostenbremse)
 EXA_MAX_PER_RUN = int(env_float("EXA_MAX_PER_RUN", 20))
+# Exa-Modelle: erstes = Hauptmodell (Signal, Einstieg), zweites = Vergleichsmodell.
+# Beide bewerten dieselbe Antwort, damit sie im Tracking direkt verglichen werden koennen.
+EXA_MODELS = env_list("EXA_MODELS", "exa,exa-pro")
+EXA_MODEL_MAIN = EXA_MODELS[0] if EXA_MODELS else "exa"
+EXA_MODEL_PRO = EXA_MODELS[1] if len(EXA_MODELS) > 1 else ""
 MATCH_RE = re.compile(r"\bvs\.?\b|game \d+ winner|map \d+ winner", re.I)
 EXCLUDE_TAGS = env_list(
     "NEW_EXCLUDE_TAGS",
@@ -192,8 +198,9 @@ def market_prices(e, n=8):
     return "; ".join(f"{name}: {p * 100:.0f}%" for p, name in rows[:n])
 
 
-def exa_analyze(e):
-    """Fragt Exa /answer nach einer Einschaetzung. Gibt dict oder None zurueck."""
+def exa_analyze(e, model=None, focus=None):
+    """Fragt Exa /answer nach einer Einschaetzung. Gibt dict oder None zurueck.
+    model: Exa-Modell (exa, exa-pro, ...). focus: Antwort, die gezielt bewertet werden soll."""
     rules = re.sub(r"\s+", " ", e.get("description") or "")[:1200]
     end = (e.get("endDate") or "")[:10]
     query = (
@@ -204,7 +211,11 @@ def exa_analyze(e):
         "Was sagen die neuesten Nachrichten? Welche Antwort ist im Vergleich zu den Quellen "
         "am ehesten falsch bepreist?"
     )
-    body = {"query": query, "systemPrompt": EXA_SYSTEM, "outputSchema": EXA_SCHEMA}
+    if focus:
+        query += (f"\nBewerte gezielt die Antwort \"{focus}\" und trage genau diese Antwort "
+                  "im Feld 'antwort' ein.")
+    model = model or EXA_MODEL_MAIN
+    body = {"query": query, "systemPrompt": EXA_SYSTEM, "outputSchema": EXA_SCHEMA, "model": model}
     for i in range(3):
         try:
             r = requests.post("https://api.exa.ai/answer", json=body, timeout=90,
@@ -226,6 +237,8 @@ def exa_analyze(e):
                     for c in (data.get("citations") or [])[:3] if c.get("url")
                 ]
                 ans["kosten"] = (data.get("costDollars") or {}).get("total")
+                ans["model"] = model
+                ans["focus"] = focus or ""
                 return ans
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(3 * (i + 1))
@@ -233,7 +246,7 @@ def exa_analyze(e):
             if r.status_code == 400 and "outputSchema" in body:
                 # Fallback: ohne strukturiertes Schema erneut fragen
                 print("Exa lehnt Schema ab, frage ohne Schema:", r.text[:200])
-                body = {"query": query, "systemPrompt": EXA_SYSTEM}
+                body = {"query": query, "systemPrompt": EXA_SYSTEM, "model": model}
                 continue
             print("Exa-Fehler:", r.status_code, r.text[:200])
             return None
@@ -244,17 +257,33 @@ def exa_analyze(e):
 
 
 def analyze_all(events):
-    """Analysiert die volumenstaerksten neuen Events (max. EXA_MAX_PER_RUN)."""
+    """Analysiert die volumenstaerksten neuen Events (max. EXA_MAX_PER_RUN).
+    Schritt 1: Hauptmodell waehlt die am ehesten falsch bepreiste Antwort.
+    Schritt 2: Vergleichsmodell bewertet genau diese Antwort (gleiche Basis fuer den Vergleich)."""
     if not EXA_API_KEY or EXA_MAX_PER_RUN <= 0:
         return
     todo = sorted(events, key=lambda e: -float(e.get("volume") or 0))[:EXA_MAX_PER_RUN]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for e, res in zip(todo, pool.map(exa_analyze, todo)):
+        for e, res in zip(todo, pool.map(lambda x: exa_analyze(x, EXA_MODEL_MAIN), todo)):
             if res:
                 e["_exa"] = res
-    done = sum(1 for e in todo if e.get("_exa"))
-    cost = sum(float(e["_exa"].get("kosten") or 0) for e in todo if e.get("_exa"))
-    print(f"Exa: {done}/{len(todo)} analysiert, Kosten ca. ${cost:.3f}")
+    if EXA_MODEL_PRO:
+        def run_pro(x):
+            m, _, _ = pick_market(x)
+            if not m:
+                return None
+            focus = m.get("groupItemTitle") if len(open_markets(x)) > 1 else None
+            return exa_analyze(x, EXA_MODEL_PRO, focus)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for e, res in zip(todo, pool.map(run_pro, todo)):
+                if res:
+                    e["_exa_pro"] = res
+    for key, name in (("_exa", EXA_MODEL_MAIN), ("_exa_pro", EXA_MODEL_PRO)):
+        if not name:
+            continue
+        done = [e[key] for e in todo if e.get(key)]
+        cost = sum(float(a.get("kosten") or 0) for a in done)
+        print(f"Exa {name}: {len(done)}/{len(todo)} analysiert, Kosten ca. ${cost:.3f}")
 
 
 SIGNAL_ICON = {"unterbewertet": "🟢", "ueberbewertet": "🔴", "fair": "⚪", "unklar": "❔"}
@@ -262,31 +291,54 @@ SIGNAL_TEXT = {"unterbewertet": "unterbewertet", "ueberbewertet": "überbewertet
                "fair": "fair bepreist", "unklar": "unklar"}
 
 
-def exa_short(a):
+def model_label(model):
+    return {"exa": "Exa", "exa-pro": "Exa Pro", "exa-fast": "Exa Fast",
+            "exa-research": "Exa Research"}.get(model or "", model or "Exa")
+
+
+def exa_short(a, label="Exa", reason_len=220):
     """Eine Zeile Exa-Fazit fuer Telegram."""
     sig = a.get("signal", "unklar")
-    line = f"{SIGNAL_ICON.get(sig, '❔')} <b>Exa: {SIGNAL_TEXT.get(sig, sig)}</b>"
+    line = f"{SIGNAL_ICON.get(sig, '❔')} <b>{label}: {SIGNAL_TEXT.get(sig, sig)}</b>"
     if a.get("antwort") and sig != "unklar":
         try:
             line += (f" – {escape(str(a['antwort'])[:30])}: Markt {float(a.get('marktpreis_prozent')):.0f}% "
-                     f"vs. Exa {float(a.get('einschaetzung_prozent')):.0f}%")
+                     f"vs. {label} {float(a.get('einschaetzung_prozent')):.0f}%")
         except (TypeError, ValueError):
             line += f" – {escape(str(a['antwort'])[:30])}"
     text = a.get("begruendung") or a.get("nachrichtenlage") or ""
-    if text:
-        line += f"\n   {escape(str(text)[:220])}"
+    if text and reason_len:
+        line += f"\n   {escape(str(text)[:reason_len])}"
     return line
 
 
-def exa_direction(e):
-    """'ja' / 'nein' je nach Exa-Delta auf der getrackten Antwort, sonst None."""
-    m, p, ok = e.get("_pick") or (None, None, False)
-    a = e.get("_exa") or {}
-    if not m or not ok or not a or a.get("signal") == "unklar":
-        return None, None
+def name_match(m, answer):
+    a = str(answer or "").strip().lower()
+    name = str(m.get("groupItemTitle") or "").strip().lower()
+    return bool(a and name and (name == a or name in a or a in name))
+
+
+def exa_prob(e, key="_exa"):
+    """Exa-Wahrscheinlichkeit (Prozent) fuer die getrackte Antwort - nur wenn sie dazu passt."""
+    m, p, ok = e.get("_pick") or pick_market(e)
+    a = e.get(key) or {}
+    if not m or not a or a.get("signal") == "unklar":
+        return None
+    if key != "_exa":
+        ok = len(open_markets(e)) <= 1 or name_match(m, a.get("antwort")) or bool(a.get("focus"))
+    if not ok:
+        return None
     try:
-        exa_p = float(a.get("einschaetzung_prozent"))
+        return float(a.get("einschaetzung_prozent"))
     except (TypeError, ValueError):
+        return None
+
+
+def exa_direction(e, key="_exa"):
+    """'ja' / 'nein' je nach Exa-Delta auf der getrackten Antwort, sonst None."""
+    m, p, _ = e.get("_pick") or pick_market(e)
+    exa_p = exa_prob(e, key)
+    if exa_p is None:
         return None, None
     d = exa_p - p * 100
     if abs(d) < 0.5:
@@ -294,10 +346,10 @@ def exa_direction(e):
     return ("ja" if d > 0 else "nein"), exa_p
 
 
-def trade_info(e):
+def trade_info(e, key="_exa"):
     """Einstieg in Exas Richtung aus dem Orderbuch: dict oder None."""
     b = e.get("_book")
-    side, exa_p = exa_direction(e)
+    side, exa_p = exa_direction(e, key)
     if not b or not side:
         return None
     entry = b.get(f"einstieg_{side}")
@@ -330,6 +382,20 @@ def trade_short(e):
     edge = "" if t["edge"] is None else f" · Edge nach Einstieg <b>{t['edge']:+.1f} PP</b>"
     return (f"💧 Einstieg {side} {t['einstieg']:.1f}¢ für {orderbook.TRADE_SIZE:.0f}$"
             f" (Spread {t['spread']:.0f}¢){edge} · {flag}")
+
+
+def agreement(e):
+    """Vergleich Haupt- vs. Vergleichsmodell auf derselben Antwort."""
+    s1, p1 = exa_direction(e, "_exa")
+    s2, p2 = exa_direction(e, "_exa_pro")
+    if p1 is None or p2 is None:
+        return ""
+    diff = p2 - p1
+    if s1 and s1 == s2:
+        return f"🤝 Beide Modelle einig: {'Ja' if s1 == 'ja' else 'Nein'} kaufen (Abstand {diff:+.0f} PP)"
+    if s1 and s2:
+        return f"⚔️ Modelle uneinig ({model_label(EXA_MODEL_MAIN)} {p1:.0f}% vs. {model_label(EXA_MODEL_PRO)} {p2:.0f}%)"
+    return ""
 
 
 # ---------------------------------------------------------------- Gruppierung
@@ -413,11 +479,32 @@ def event_line(e, now):
             f'   {money(e.get("volume"))} Vol · {money(e.get("liquidity"))} Liq · {age}\n'
             f'   {top_answers(e)}')
     if e.get("_exa"):
-        line += "\n   " + exa_short(e["_exa"])
+        line += "\n   " + exa_short(e["_exa"], model_label(EXA_MODEL_MAIN))
+    if e.get("_exa_pro"):
+        line += "\n   " + exa_short(e["_exa_pro"], model_label(EXA_MODEL_PRO), reason_len=150)
+        agree = agreement(e)
+        if agree:
+            line += "\n   " + agree
     ts = trade_short(e)
     if ts:
         line += "\n   " + ts
     return line
+
+
+def pro_html(e):
+    a = e.get("_exa_pro")
+    if not a:
+        return ""
+    sig = a.get("signal", "unklar")
+    try:
+        nums = f" – {float(a.get('einschaetzung_prozent')):.0f}%"
+    except (TypeError, ValueError):
+        nums = ""
+    ag = agreement(e)
+    return (f'<hr><b>{SIGNAL_ICON.get(sig, "❔")} {model_label(EXA_MODEL_PRO)}: '
+            f'{SIGNAL_TEXT.get(sig, sig)}</b>{nums}'
+            f'<br><small><i>{escape(str(a.get("begruendung", "")))}</i></small>'
+            + (f"<br><small>{escape(ag)}</small>" if ag else ""))
 
 
 def build_html(groups, now, stamp):
@@ -449,7 +536,7 @@ def build_html(groups, now, stamp):
                             f'{SIGNAL_TEXT.get(sig, sig)}</b>{nums}'
                             f'<br><small>{escape(str(a.get("nachrichtenlage", "")))}</small>'
                             f'<br><small><i>{escape(str(a.get("begruendung", "")))}</i></small>'
-                            f'<br><small>{srcs}</small></td>')
+                            f'<br><small>{srcs}</small>{pro_html(e)}</td>')
             else:
                 exa_cell = '<td data-v="9"><small>nicht analysiert</small></td>'
             t = trade_info(e)
@@ -557,6 +644,9 @@ LOG_FIELDS = [
     # Orderbuch bei Erfassung (Cent) - Einstieg = Durchschnittspreis fuer TRADE_SIZE $ innerhalb FILL_WINDOW
     "ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja", "einstieg_nein",
     "gefuellt_nein", "richtung", "einstieg", "edge_pp", "handelbar", "handelbar_grund", "trade_size",
+    # Vergleichsmodell (z. B. exa-pro) auf derselben Antwort
+    "modell", "modell_pro", "exa_pro_prozent", "delta_pro_pp", "signal_pro", "begruendung_pro",
+    "richtung_pro", "einstieg_pro", "edge_pro_pp", "handelbar_pro", "kosten_exa", "kosten_pro",
 ]
 
 
@@ -595,16 +685,14 @@ def log_markets(events, now):
     """Haengt alle neuen Maerkte (mit oder ohne Exa-Analyse) an data/exa_log.csv an."""
     rows = []
     for e in events:
-        m, p, exa_ok = e.get("_pick") or pick_market(e)
+        m, p, _ = e.get("_pick") or pick_market(e)
         if not m:
             continue
         a = e.get("_exa") or {}
-        exa_p = None
-        if a and exa_ok and a.get("signal") != "unklar":
-            try:
-                exa_p = float(a.get("einschaetzung_prozent"))
-            except (TypeError, ValueError):
-                exa_p = None
+        exa_p = exa_prob(e, "_exa")
+        a2 = e.get("_exa_pro") or {}
+        pro_p = exa_prob(e, "_exa_pro")
+        t2 = trade_info(e, "_exa_pro") or {}
         b = e.get("_book") or {}
         sp = orderbook.spread(b, "ja") if b else None
         if sp is None:
@@ -642,6 +730,18 @@ def log_markets(events, now):
             "handelbar": "" if not t else ("ja" if t["handelbar"] else "nein"),
             "handelbar_grund": t.get("grund", ""),
             "trade_size": orderbook.TRADE_SIZE,
+            "modell": a.get("model", "") if a else "",
+            "modell_pro": a2.get("model", "") if a2 else "",
+            "exa_pro_prozent": "" if pro_p is None else round(pro_p, 1),
+            "delta_pro_pp": "" if pro_p is None else round(pro_p - mkt, 1),
+            "signal_pro": a2.get("signal", "") if a2 else "",
+            "begruendung_pro": a2.get("begruendung", "") if a2 else "",
+            "richtung_pro": t2.get("richtung", ""),
+            "einstieg_pro": "" if t2.get("einstieg") is None else t2["einstieg"],
+            "edge_pro_pp": "" if t2.get("edge") is None else t2["edge"],
+            "handelbar_pro": "" if not t2 else ("ja" if t2["handelbar"] else "nein"),
+            "kosten_exa": "" if not a or a.get("kosten") is None else a.get("kosten"),
+            "kosten_pro": "" if not a2 or a2.get("kosten") is None else a2.get("kosten"),
         })
     orderbook.csv_append(LOG_FILE, LOG_FIELDS, rows)
 
