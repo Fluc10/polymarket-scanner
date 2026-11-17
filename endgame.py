@@ -455,3 +455,356 @@ def sheet_tabs(log, markets_now, prices, results, now):
     srows.extend(matrix_rows(pts))
     srows.append([])
     bold.append(len(srows))
+    srows.append(["Details"])
+    bold.append(len(srows))
+    srows.append(["Zeitpunkt vor Ablauf", "Favoritenpreis", "Anzahl Märkte", "Ø Preis %",
+                  "Tatsächlich gewonnen %", "Differenz PP", "Ø Gewinn je 100 $ auf Favorit", "Fazit"])
+    first_detail = len(srows)
+    srows.extend(calib_rows(pts))
+    srows.append([])
+    ex = exa_calibration(log, results)
+    if ex:
+        bold.append(len(srows))
+        srows.append(["Wer lag besser? Brier-Score bei der ersten Prüfung (kleiner = besser)"])
+        bold.append(len(srows))
+        srows.append(["Quelle", "Märkte", "Brier-Score"])
+        srows.extend(ex)
+        srows.append([])
+    bold.append(len(srows))
+    srows.append(["Erklärung"])
+    for t in [
+        "Favorit = die Seite (Ja oder Nein), die zu diesem Zeitpunkt über 50 % steht. Favoritenpreis 85 % heißt: der Markt glaubt zu 85 %, dass der Favorit gewinnt.",
+        "Tatsächlich gewonnen % sollte bei einem fairen Markt etwa dem Ø Preis entsprechen. Liegt es klar darüber, sind Favoriten in dieser Phase systematisch zu billig.",
+        "Ø Gewinn je 100 $: wenn man in jedem dieser Märkte 100 $ zum Mittelpreis auf den Favoriten gesetzt hätte (ohne Spread). Positiv = Edge.",
+        "Jeder Markt wird ab dem ersten Fund täglich weiter beobachtet, auch wenn er später aus dem Bereich 15–85 % läuft – so entsteht keine Verzerrung durch Aussortieren.",
+        "Aussagekräftig ab etwa 30 Märkten pro Zeile; darunter ist es Zufall.",
+    ]:
+        srows.append([t])
+    stats_tab = {"title": "Endspurt-Statistik", "header": None, "rows": srows, "bold_rows": bold,
+                 "widths": [22, 16, 14, 12, 18, 12, 22, 34], "wrap_cols": [],
+                 "posneg_cols": [5, 6]}
+    return [analysen, stats_tab]
+
+
+def num_field(m, *keys):
+    for k in keys:
+        try:
+            v = m.get(k)
+            if v not in (None, ""):
+                return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def market_rows(cands, now, new_ids):
+    rows = []
+    for m in sorted(cands, key=lambda m: days_left(m, now)):
+        ev = (m.get("events") or [{}])[0]
+        p = yes_price(m) * 100
+        bid, ask = num_field(m, "bestBid"), num_field(m, "bestAsk")
+        rows.append({
+            "id": str(m.get("id")), "neu": str(m.get("id")) in new_ids,
+            "frage": m.get("question") or ev.get("title") or "", "slug": ev.get("slug") or m.get("slug") or "",
+            "kategorie": category(m), "ablauf": (m.get("endDate") or "")[:16].replace("T", " "),
+            "tage": days_left(m, now), "ja": p, "fav": "Ja" if p >= 50 else "Nein", "favp": max(p, 100 - p),
+            "spread": None if bid is None or ask is None else round((ask - bid) * 100, 1),
+            "vol": num_field(m, "volumeNum", "volume") or 0, "liq": num_field(m, "liquidityNum", "liquidity") or 0,
+            "vol24": num_field(m, "volume24hr") or 0,
+        })
+    return rows
+
+
+def list_tab(rows):
+    return {
+        "title": "Endspurt-Märkte",
+        "header": ["Neu", "Frage", "Kategorie", "Ablauf (UTC)", "Tage bis Ende", "Ja %", "Favorit",
+                   "Favoritenpreis %", "Spread ¢", "Volumen $", "Volumen 24h $", "Liquidität $"],
+        "rows": [["🆕" if r["neu"] else "", r["frage"], r["kategorie"], r["ablauf"], round(r["tage"], 1),
+                  round(r["ja"], 1), r["fav"], round(r["favp"], 1), r["spread"], round(r["vol"]),
+                  round(r["vol24"]), round(r["liq"])] for r in rows],
+        "links": [f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "" for r in rows],
+        "link_col": 1,
+        "widths": [5, 70, 18, 16, 10, 8, 8, 12, 9, 12, 12, 12],
+        "num_cols": {4: "0.0", 5: "0.0", 7: "0.0", 8: "0.0", 9: "#,##0", 10: "#,##0", 11: "#,##0"},
+    }
+
+
+def money(v):
+    return f"${v / 1_000_000:.1f}M" if v >= 1_000_000 else f"${v / 1000:.0f}k" if v >= 1000 else f"${v:.0f}"
+
+
+def build_html(rows, stamp):
+    trs = []
+    for r in rows:
+        url = f"https://polymarket.com/event/{r['slug']}"
+        sp = "" if r["spread"] is None else f"{r['spread']:.0f} ¢"
+        trs.append(
+            f"<tr><td>{'🆕' if r['neu'] else ''}</td>"
+            f'<td><a href="{escape(url)}" target="_blank">{escape(r["frage"])}</a></td>'
+            f"<td>{escape(r['kategorie'])}</td>"
+            f'<td class="n" data-v="{r["tage"]:.2f}">{r["tage"]:.1f}</td>'
+            f'<td class="n" data-v="{r["ja"]:.1f}">{r["ja"]:.0f} %</td>'
+            f'<td class="n" data-v="{r["favp"]:.1f}">{r["fav"]} {r["favp"]:.0f} %</td>'
+            f'<td class="n" data-v="{r["spread"] if r["spread"] is not None else 999}">{sp}</td>'
+            f'<td class="n" data-v="{r["vol"]:.0f}">{money(r["vol"])}</td>'
+            f'<td class="n" data-v="{r["vol24"]:.0f}">{money(r["vol24"])}</td>'
+            f'<td class="n" data-v="{r["liq"]:.0f}">{money(r["liq"])}</td></tr>')
+    cols = ["Neu", "Frage", "Kategorie", "Tage bis Ende", "Ja", "Favorit", "Spread", "Volumen",
+            "Vol. 24h", "Liquidität"]
+    head = "".join(f'<th onclick="sortBy({i})">{c}</th>' for i, c in enumerate(cols))
+    return f"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Endspurt {stamp}</title><style>
+body{{font-family:system-ui,sans-serif;margin:16px;background:#fafafa}}
+input{{padding:8px;width:100%;max-width:400px;margin-bottom:12px;font-size:15px}}
+table{{border-collapse:collapse;width:100%;background:#fff;font-size:14px}}
+th,td{{padding:6px 10px;border-bottom:1px solid #e5e5e5;text-align:left;vertical-align:top}}
+th{{background:#0b5f3a;color:#fff;cursor:pointer;position:sticky;top:0}}
+td.n{{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}}
+tr:hover{{background:#f0fff6}} a{{color:#0b5fff;text-decoration:none}} p{{color:#444;font-size:14px}}</style></head><body>
+<h2>Endspurt – {stamp} – {len(rows)} Märkte</h2>
+<p>Märkte mit Ablauf in {MIN_DAYS:.0f}–{MAX_DAYS:.0f} Tagen, Ja-Preis {P_LOW:.0f}–{P_HIGH:.0f} %, ab {money(MIN_VOLUME)} Volumen,
+nicht aufgelöst oder vorgeschlagen. Ohne Sportspiele, Esports-Spiele, Krypto-Preise, Wetter. Spaltenkopf anklicken zum Sortieren.</p>
+<input id="q" placeholder="Suchen …" oninput="filter()">
+<table id="t"><thead><tr>{head}</tr></thead><tbody>{''.join(trs)}</tbody></table>
+<script>
+let dir={{}};
+function sortBy(c){{const tb=document.querySelector('#t tbody');const rows=[...tb.rows];dir[c]=!dir[c];
+rows.sort((a,b)=>{{const x=a.cells[c],y=b.cells[c];
+const vx=x.dataset.v!==undefined?parseFloat(x.dataset.v):x.innerText.toLowerCase();
+const vy=y.dataset.v!==undefined?parseFloat(y.dataset.v):y.innerText.toLowerCase();
+return (vx>vy?1:vx<vy?-1:0)*(dir[c]?-1:1);}});rows.forEach(r=>tb.appendChild(r));}}
+function filter(){{const q=document.getElementById('q').value.toLowerCase();
+for(const r of document.querySelectorAll('#t tbody tr'))r.style.display=r.innerText.toLowerCase().includes(q)?'':'none';}}
+</script></body></html>""".encode("utf-8")
+
+
+def send_html(filename, content, caption):
+    if not et.TOKEN or not et.CHAT_ID:
+        with open(filename, "wb") as f:
+            f.write(content)
+        print("Datei gespeichert:", filename)
+        return
+    r = requests.post(f"https://api.telegram.org/bot{et.TOKEN}/sendDocument",
+                      data={"chat_id": et.CHAT_ID, "caption": caption},
+                      files={"document": (filename, content, "text/html")}, timeout=60)
+    if r.status_code != 200:
+        print("Telegram-Fehler:", r.status_code, r.text[:300])
+
+
+def order_sheets():
+    """Endspurt-Blaetter vor die Competition-Blaetter sortieren."""
+    sh = gsheet._open()
+    meta = sh.fetch_sheet_metadata({"fields": "sheets(properties(sheetId,title,index))"})
+    sheets = sorted(meta.get("sheets", []), key=lambda s: s["properties"]["index"])
+    titles = [s["properties"]["title"] for s in sheets]
+    ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
+    ours = [t for t in ("Endspurt-Märkte", "Endspurt", "Endspurt-Statistik") if t in ids]
+    comp = [t for t in titles if t.startswith("Competition")]
+    rest = [t for t in titles if t not in ours and t not in comp]
+    req = [{"updateSheetProperties": {"properties": {"sheetId": ids[t], "index": i}, "fields": "index"}}
+           for i, t in enumerate(rest + ours + comp)]
+    sh.batch_update({"requests": req})
+
+
+def signal_block(m, row, now):
+    e1, e2 = et.num(row["edge_pp"]), et.num(row["edge_pro_pp"])
+    use_pro = e2 is not None and (e1 is None or e2 > e1)
+    side = row["richtung_pro"] if use_pro else row["richtung"]
+    edge = e2 if use_pro else e1
+    entry = et.num(row["einstieg_pro"]) if use_pro else et.num(row["einstieg"])
+    filled = et.num(row.get(f"gefuellt_{side}")) if side else None
+    sp = orderbook.spread({k: et.num(row.get(k)) for k in BOOK_KEYS}, side) if side else None
+    ok = side and sp is not None and sp <= orderbook.MAX_SPREAD and (filled or 0) >= orderbook.TRADE_SIZE - 0.01
+    lines = [f'🎯 <a href="https://polymarket.com/event/{row["event_slug"]}">{escape(row["frage"][:110])}</a>'
+             f" – endet in {float(row['tage_bis_ende']):.1f} Tagen"]
+    t = f"   Markt Ja {float(row['markt_prozent']):.0f}%"
+    if row["exa_prozent"]:
+        t += f" · Exa {float(row['exa_prozent']):.0f}% ({STATUS_TEXT.get(row['exa_status'], '')})"
+    if row["exa_pro_prozent"]:
+        t += f" · Exa Pro {float(row['exa_pro_prozent']):.0f}%"
+    lines.append(t)
+    if side and entry is not None:
+        lines.append(f"   💧 Einstieg {'Ja' if side == 'ja' else 'Nein'} {entry:.1f}¢ für "
+                     f"{min(orderbook.TRADE_SIZE, filled or 0):.0f}$ (Spread {sp or 0:.0f}¢) · "
+                     f"Edge <b>{edge:+.1f}¢</b> ({'Exa Pro' if use_pro else 'Exa'}) · "
+                     f"{'✅ handelbar' if ok else '⚠️ dünnes Orderbuch'}")
+    why = row["exa_ereignis"] or row["exa_begruendung"]
+    if why:
+        lines.append(f"   <i>{escape(why[:220])}</i>")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- Ablauf
+
+def main():
+    if os.environ.get("GITHUB_ACTIONS") and (not et.TOKEN or not et.CHAT_ID):
+        raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    stamp = now.strftime("%Y-%m-%d %H:%M")
+
+    cands = candidates(now)
+    print(f"{len(cands)} Kandidaten im Fenster")
+
+    # 1) Neue Maerkte fuer die Statistik registrieren
+    known = {x["market_id"] for x in et.read_csv(MARKETS_FILE)}
+    new = []
+    for m in cands:
+        mid = str(m.get("id"))
+        if mid in known:
+            continue
+        ev = (m.get("events") or [{}])[0]
+        new.append({"erfasst_am": stamp, "market_id": mid, "event": ev.get("title", ""),
+                    "event_slug": ev.get("slug", ""), "frage": m.get("question", ""),
+                    "antwort": m.get("groupItemTitle") or "Ja", "enddatum": (m.get("endDate") or "")[:16],
+                    "volumen": round(float(m.get("volumeNum") or m.get("volume") or 0)),
+                    "kategorie": category(m), "erster_preis": round(yes_price(m) * 100, 1)})
+    if new:
+        orderbook.csv_append(MARKETS_FILE, MARKET_FIELDS, new)
+    tracked = et.read_csv(MARKETS_FILE)
+
+    # 2) Exa-Pruefung (neu oder stark bewegt), naechster Ablauf zuerst
+    state = load_state()
+    todo = sorted([m for m in cands if needs_check(m, state, now)],
+                  key=lambda m: (str(m.get("id")) in state, days_left(m, now)))[:EXA_MAX if EXA_API_KEY else 0]
+    log_rows = []
+    if todo:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            main_res = list(pool.map(lambda m: exa_ask(m, MODEL_MAIN, now), todo))
+            pro_res = list(pool.map(lambda m: exa_ask(m, MODEL_PRO, now), todo)) if MODEL_PRO else [None] * len(todo)
+            books = list(pool.map(lambda m: orderbook.market_book(m) or {}, todo))
+        for m, a, a2, b in zip(todo, main_res, pro_res, books):
+            mid = str(m.get("id"))
+            state[mid] = {"p": round(yes_price(m) * 100, 1), "t": now.isoformat()}
+            p1, p2 = prob_of(a), prob_of(a2)
+            d1, d2 = decide(p1, b), decide(p2, b)
+            ev = (m.get("events") or [{}])[0]
+            log_rows.append({
+                "erfasst_am": stamp, "market_id": mid, "event": ev.get("title", ""),
+                "event_slug": ev.get("slug", ""), "frage": m.get("question", ""),
+                "antwort": m.get("groupItemTitle") or "Ja", "enddatum": (m.get("endDate") or "")[:16],
+                "tage_bis_ende": round(days_left(m, now), 2),
+                "volumen": round(float(m.get("volumeNum") or m.get("volume") or 0)),
+                "markt_prozent": round(yes_price(m) * 100, 1),
+                "exa_prozent": "" if p1 is None else p1, "exa_status": (a or {}).get("status", ""),
+                "exa_ereignis": (a or {}).get("schluesselereignis", ""),
+                "exa_begruendung": (a or {}).get("begruendung", ""),
+                "exa_nachrichtenlage": (a or {}).get("nachrichtenlage", ""),
+                "exa_quellen": " | ".join((a or {}).get("quellen") or []),
+                "exa_pro_prozent": "" if p2 is None else p2, "exa_pro_status": (a2 or {}).get("status", ""),
+                "exa_pro_begruendung": (a2 or {}).get("begruendung", ""),
+                **{k: ("" if b.get(k) is None else b.get(k)) for k in BOOK_KEYS},
+                "richtung": d1["seite"] if d1 else "", "einstieg": d1["einstieg"] if d1 else "",
+                "edge_pp": d1["edge"] if d1 else "",
+                "richtung_pro": d2["seite"] if d2 else "", "einstieg_pro": d2["einstieg"] if d2 else "",
+                "edge_pro_pp": d2["edge"] if d2 else "",
+                "kosten_exa": (a or {}).get("kosten") or "", "kosten_pro": (a2 or {}).get("kosten") or "",
+            })
+        orderbook.csv_append(LOG_FILE, LOG_FIELDS, log_rows)
+        save_state(state)
+
+    # 3) Tagespreise + Ergebnisse fuer alle beobachteten Maerkte
+    results = et.read_csv(RESULTS_FILE)
+    done = {r["market_id"] for r in results}
+    open_ids = [x["market_id"] for x in tracked if x["market_id"] not in done]
+    markets_now = et.fetch_markets(open_ids) if open_ids else {}
+    prices = et.read_csv(PRICES_FILE)
+    have = {(x["datum"], x["market_id"]) for x in prices}
+    new_prices, new_results = [], []
+    for mid in open_ids:
+        m = markets_now.get(mid)
+        if not m:
+            continue
+        o = et.outcome_of(m)
+        if o is not None:
+            new_results.append({"market_id": mid, "ergebnis": o, "erkannt_am": stamp})
+            continue
+        p, d = yes_price(m), days_left(m, now)
+        if p is None or d is None or (today, mid) in have or m.get("closed"):
+            continue
+        new_prices.append({"datum": today, "market_id": mid, "tage_bis_ende": round(d, 2),
+                           "ja_prozent": round(p * 100, 1), "uma_status": m.get("umaResolutionStatus") or ""})
+    if new_prices:
+        orderbook.csv_append(PRICES_FILE, PRICE_FIELDS, new_prices)
+    if new_results:
+        orderbook.csv_append(RESULTS_FILE, RESULT_FIELDS, new_results)
+
+    # 4) Orderbuch-Schnappschuss fuer analysierte offene Maerkte (Bewertung in der Competition)
+    log = et.read_csv(LOG_FILE)
+    snaps = et.read_csv(et.SNAP_FILE)
+    have_snap = {(s["datum"], s["market_id"]) for s in snaps}
+    snap_ids = sorted({x["market_id"] for x in log} - done - {r["market_id"] for r in new_results})
+    snap_ms = [markets_now[i] for i in snap_ids if i in markets_now and (today, i) not in have_snap
+               and not markets_now[i].get("closed")]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        sb = list(pool.map(lambda m: orderbook.market_book(m) or {}, snap_ms))
+    snap_rows = [{"datum": today, "market_id": str(m.get("id")), "prozent": round(yes_price(m) * 100, 1),
+                  "geschlossen": "nein", "ergebnis": "",
+                  **{k: ("" if b.get(k) is None else b.get(k)) for k in BOOK_KEYS}} for m, b in zip(snap_ms, sb)]
+    for r in new_results:
+        if (today, r["market_id"]) not in have_snap and r["market_id"] in {x["market_id"] for x in log}:
+            snap_rows.append({"datum": today, "market_id": r["market_id"], "prozent": 100 if r["ergebnis"] else 0,
+                              "geschlossen": "ja", "ergebnis": r["ergebnis"]})
+    if snap_rows:
+        orderbook.csv_append(et.SNAP_FILE, et.SNAP_FIELDS, snap_rows)
+
+    # 5) Google Sheet
+    url = ""
+    results = et.read_csv(RESULTS_FILE)
+    mrows = market_rows(cands, now, {x["market_id"] for x in new})
+    analysen, stats_tab = sheet_tabs(log, markets_now, et.read_csv(PRICES_FILE), results, now.astimezone(et.TZ))
+    tabs = [list_tab(mrows)] + ([analysen] if log else []) + [stats_tab]
+    if gsheet.enabled():
+        try:
+            gsheet.write_tables(tabs)
+            order_sheets()
+            url = gsheet.sheet_url()
+        except Exception as ex:
+            print("Google-Sheet-Fehler:", ex)
+
+    # 6) Telegram: Zusammenfassung, neue Maerkte, HTML-Datei mit allen
+    local = now.astimezone(et.TZ)
+    signals = [r for r in log_rows
+               if (et.num(r["edge_pp"]) or -99) >= MIN_EDGE or (et.num(r["edge_pro_pp"]) or -99) >= MIN_EDGE]
+    signals.sort(key=lambda r: -max(et.num(r["edge_pp"]) or -99, et.num(r["edge_pro_pp"]) or -99))
+    fresh = [r for r in mrows if r["neu"]]
+    head = (f"🎯 <b>Endspurt {local:%d.%m. %H:%M}</b>\n"
+            f"<b>{len(cands)} Märkte</b> laufen in {MIN_DAYS:.0f}–{MAX_DAYS:.0f} Tagen ab "
+            f"(Ja {P_LOW:.0f}–{P_HIGH:.0f} %, ab {money(MIN_VOLUME)} Vol.) · {len(fresh)} neu"
+            + (f" · {len(new_results)} aufgelöst" if new_results else ""))
+    if log_rows:
+        head += f" · {len(log_rows)} mit Exa geprüft, {len(signals)} Signale ≥ {MIN_EDGE:.0f} ¢"
+    lines = []
+    for r in fresh[:30]:
+        lines.append(f'• <a href="https://polymarket.com/event/{r["slug"]}">{escape(r["frage"][:90])}</a>\n'
+                     f'   Ja {r["ja"]:.0f} % · endet in {r["tage"]:.1f} Tagen · {money(r["vol"])} Vol.'
+                     + (f' · Spread {r["spread"]:.0f} ¢' if r["spread"] is not None else ""))
+    if len(fresh) > 30:
+        lines.append(f"… und {len(fresh) - 30} weitere in der Datei")
+    msg = head + ("\n\n<b>Neu im Fenster:</b>\n" + "\n".join(lines) if lines else "")
+    blocks = [signal_block(None, r, now) for r in signals[:10]]
+    if blocks:
+        msg += "\n\n<b>Exa-Signale:</b>\n\n" + "\n\n".join(blocks)
+    if url:
+        msg += f'\n\n📄 <a href="{url}">Endspurt-Märkte + Statistik im Google Sheet</a>'
+    chunk = ""
+    for line in msg.split("\n"):  # in Teilen senden, ohne HTML-Zeilen zu zerschneiden
+        if len(chunk) + len(line) + 1 > 3900:
+            et.send(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + line
+    if chunk:
+        et.send(chunk)
+    if mrows:
+        stamp_l = local.strftime("%Y-%m-%d_%H%M")
+        send_html(f"endspurt_{stamp_l}.html", build_html(mrows, stamp_l),
+                  f"🎯 {len(mrows)} Märkte, Ablauf in {MIN_DAYS:.0f}–{MAX_DAYS:.0f} Tagen – im Browser öffnen")
+    if not url:
+        et.send_document(f"endspurt_{today}.xlsx", et.build_excel(tabs), "🎯 Endspurt – in Excel öffnen")
+    print(f"{len(cands)} Kandidaten, {len(new)} neu, {len(log_rows)} geprüft, {len(signals)} Signale")
+
+
+if __name__ == "__main__":
+    main()
