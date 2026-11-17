@@ -1,0 +1,55 @@
+name: Endspurt-Scanner
+
+on:
+  schedule:
+    # 2x täglich: 07:47 und 17:47 Wien im Winter (06:47 / 16:47 UTC)
+    - cron: "47 6 * * *"
+    - cron: "47 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: polymarket-data
+  cancel-in-progress: false
+
+jobs:
+  endgame:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Endspurt-Scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          ENDGAME_EXA_MAX: ${{ vars.ENDGAME_EXA_MAX || '0' }}
+          ENDGAME_MIN_VOLUME: ${{ vars.ENDGAME_MIN_VOLUME || '2000' }}
+          COMP_MIN_EDGE: ${{ vars.COMP_MIN_EDGE || '10' }}
+        run: python endgame.py
+
+      - name: Daten speichern
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
+          git add data/ || true
+          if git diff --cached --quiet; then echo "Nichts zu speichern"; exit 0; fi
+          git commit -m "Endspurt-Scanner $(date -u +%Y-%m-%d_%H%M)"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 10
+          done
+          exit 1
