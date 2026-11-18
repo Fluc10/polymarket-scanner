@@ -4,7 +4,7 @@ Endspurt-Scanner fuer Polymarket.
 Sucht Maerkte, die in ENDGAME_MIN_DAYS bis ENDGAME_MAX_DAYS Tagen ablaufen, deren Ja-Preis
 zwischen ENDGAME_P_LOW und ENDGAME_P_HIGH Prozent liegt (also noch keine Seite ueber 85 ¢)
 und die noch nicht aufgeloest oder von UMA vorgeschlagen sind. Ausgeschlossen: Sportspiele,
-Esports-Spiele, Krypto-Preise, Wetter.
+Esports-Spiele, Krypto-Preise, Wetter, Anzahl Tweets/Posts, Schiffsverkehr durch Kanaele/Meerengen.
 
 1. Exa + Exa Pro pruefen, ob das Ergebnis laut aktuellen Nachrichten schon (nahezu) feststeht,
    obwohl der Preis es noch nicht zeigt. Signale mit echtem Einstieg (100 $, Fuellung <= 5 ¢)
@@ -59,13 +59,18 @@ MODELS = [x.strip().lower() for x in (os.environ.get("EXA_MODELS") or "exa,exa-p
 MODEL_MAIN = MODELS[0] if MODELS else "exa"
 MODEL_PRO = MODELS[1] if len(MODELS) > 1 else ""
 
-EXCLUDE_TAGS = {"games", "crypto-prices", "up-or-down", "weather", "hide-from-new"}
+EXCLUDE_TAGS = {"games", "crypto-prices", "up-or-down", "weather", "hide-from-new", "tweet-markets"}
 GAME_RE = re.compile(r"\bvs\.?\b|\bv\.\s|game \d|map \d|o/u|over/under|spread|handicap|moneyline|"
                      r"total (goals|points|kills|runs|maps)|both teams to score|first blood|"
                      r"win on \d{4}-\d\d-\d\d|end in a draw", re.I)
 CRYPTO_RE = re.compile(r"\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|doge|dogecoin|bnb|hype)\b.*"
                        r"\b(price|above|below|reach|hit|dip|close)\b|price of ", re.I)
 WEATHER_RE = re.compile(r"temperature|precipitation|rainfall|snowfall|°[cf]\b", re.I)
+# Auf Wunsch ausgeschlossen: Anzahl Tweets/Posts und Schiffsverkehr durch Kanaele/Meerengen
+TOPIC_RE = re.compile(r"#\s*(tweets|posts)|truth social posts|\btweets? (from|between)|"
+                      r"\bpost \d+\s*[-–]\s*\d+|\bpost \d+\+|"
+                      r"ships? (transit|traffic|pass)|ship traffic|vessels? (transit|pass)|"
+                      r"transits? (of|through) the (suez|panama|bab|strait|canal)", re.I)
 
 MARKET_FIELDS = ["erfasst_am", "market_id", "event", "event_slug", "frage", "antwort", "enddatum",
                  "volumen", "kategorie", "erster_preis"]
@@ -167,7 +172,7 @@ def excluded(m):
     if tags & {"sports", "esports"} and GAME_RE.search(title):
         return True
     return bool(GAME_RE.search(m.get("question") or "") or CRYPTO_RE.search(title)
-                or WEATHER_RE.search(title))
+                or WEATHER_RE.search(title) or TOPIC_RE.search(title))
 
 
 def days_left(m, now):
@@ -565,7 +570,7 @@ td.n{{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}}
 tr:hover{{background:#f0fff6}} a{{color:#0b5fff;text-decoration:none}} p{{color:#444;font-size:14px}}</style></head><body>
 <h2>Endspurt – {stamp} – {len(rows)} Märkte</h2>
 <p>Märkte mit Ablauf in {MIN_DAYS:.0f}–{MAX_DAYS:.0f} Tagen, Ja-Preis {P_LOW:.0f}–{P_HIGH:.0f} %, ab {money(MIN_VOLUME)} Volumen,
-nicht aufgelöst oder vorgeschlagen. Ohne Sportspiele, Esports-Spiele, Krypto-Preise, Wetter. Spaltenkopf anklicken zum Sortieren.</p>
+nicht aufgelöst oder vorgeschlagen. Ohne Sportspiele, Esports-Spiele, Krypto-Preise, Wetter, Tweet-/Post-Anzahl, Schiffsverkehr. Spaltenkopf anklicken zum Sortieren.</p>
 <input id="q" placeholder="Suchen …" oninput="filter()">
 <table id="t"><thead><tr>{head}</tr></thead><tbody>{''.join(trs)}</tbody></table>
 <script>
@@ -720,6 +725,8 @@ def main():
         o = et.outcome_of(m)
         if o is not None:
             new_results.append({"market_id": mid, "ergebnis": o, "erkannt_am": stamp})
+            continue
+        if excluded(m):  # nachtraeglich ausgeschlossene Themen nicht weiter beobachten
             continue
         p, d = yes_price(m), days_left(m, now)
         if p is None or d is None or (today, mid) in have or m.get("closed"):
