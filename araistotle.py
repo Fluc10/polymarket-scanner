@@ -1,15 +1,16 @@
 """
 ArAIstotle (Facticity.AI) - eigene Wahrscheinlichkeit fuer Polymarket-Maerkte.
 
-Spricht den Facticity-MCP-Server direkt per HTTP (JSON-RPC, "Streamable HTTP") an
-und ruft das Tool `araistotle_insight` auf.
+REST-API https://api.facticity.ai (Header X-API-KEY):
+  GET  /get-credits                                  Guthaben (kostenlos)
+  GET  /asp/prediction-insight/<id>/status?source=polymarket   Status (kostenlos)
+  POST /araistotle-insight/  {polymarket_market_id}  Analyse holen / anstossen
 
 Kosten (Facticity-Credits): vorhandene Analyse 2 Credits, neue Analyse 10 Credits.
 Neue Analysen laufen asynchron - wir fragen nach ARAISTOTLE_WAIT Sekunden erneut nach.
 
 Secret:   FACTICITY_API_KEY
 Variablen (optional):
-  FACTICITY_MCP_URL        eigene Server-Adresse (sonst werden bekannte Adressen probiert)
   ARAISTOTLE_MAX_PER_RUN   max. Maerkte pro Lauf (Standard 20)
   ARAISTOTLE_WAIT          max. Wartezeit auf neue Analysen in Sekunden (Standard 300)
   ARAISTOTLE_LOW_CREDITS   Warnung ab diesem Guthaben (Standard 60)
@@ -24,9 +25,7 @@ import time
 import requests
 
 API_KEY = os.environ.get("FACTICITY_API_KEY", "").strip()
-URLS = [u for u in [os.environ.get("FACTICITY_MCP_URL", "").strip(),
-                    "https://api.facticity.ai/mcp", "https://mcp.facticity.ai/mcp",
-                    "https://mcp.facticity.ai/", "https://facticityai--ai-seer.run.tools/mcp"] if u]
+API = (os.environ.get("FACTICITY_API_URL") or "https://api.facticity.ai").rstrip("/")
 
 
 def _int(name, default):
@@ -39,7 +38,7 @@ def _int(name, default):
 MAX_PER_RUN = _int("ARAISTOTLE_MAX_PER_RUN", 20)
 WAIT = _int("ARAISTOTLE_WAIT", 300)
 LOW_CREDITS = _int("ARAISTOTLE_LOW_CREDITS", 60)
-PENDING = {"pending", "processing", "queued", "running", "generating", "in_progress", "started"}
+QUEUED = "QUEUED"
 
 
 class FacticityError(Exception):
@@ -50,117 +49,61 @@ def enabled():
     return bool(API_KEY) and MAX_PER_RUN > 0
 
 
-def _auth_variants():
-    return [{"X-API-KEY": API_KEY, "Authorization": f"Bearer {API_KEY}"},
-            {"X-API-KEY": API_KEY},
-            {"Authorization": f"Bearer {API_KEY}"}]
-
-
-def _parse(resp):
-    """JSON-RPC-Antwort aus JSON oder SSE (text/event-stream) lesen."""
-    ctype = resp.headers.get("Content-Type", "")
-    if "text/event-stream" in ctype:
-        last = None
-        for line in resp.text.splitlines():
-            if line.startswith("data:"):
-                try:
-                    msg = json.loads(line[5:].strip())
-                except ValueError:
-                    continue
-                if "result" in msg or "error" in msg:
-                    last = msg
-        return last or {}
-    try:
-        return resp.json()
-    except ValueError:
-        return {}
-
-
 class Client:
-    """Minimaler MCP-Client: initialize + tools/call."""
+    """REST-Client fuer die Facticity-API (wie im frueheren facticity.py)."""
 
     def __init__(self):
-        self.url, self.headers, self.session = None, None, None
-        self._id = 0
-
-    def _post(self, url, headers, payload, timeout=60):
-        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-             "MCP-Protocol-Version": "2025-03-26", **headers}
-        if self.session:
-            h["Mcp-Session-Id"] = self.session
-        return requests.post(url, json=payload, headers=h, timeout=timeout)
+        self.s = requests.Session()
+        self.s.headers.update({"X-API-KEY": API_KEY, "Content-Type": "application/json"})
 
     def connect(self):
-        errors = []
-        for url in URLS:
-            for headers in _auth_variants():
-                self.session = None
-                try:
-                    r = self._post(url, headers, {
-                        "jsonrpc": "2.0", "id": 0, "method": "initialize",
-                        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
-                                   "clientInfo": {"name": "polymarket-scanner", "version": "1"}}})
-                except requests.RequestException as ex:
-                    errors.append(f"{url}: {type(ex).__name__}")
-                    break
-                if r.status_code != 200:
-                    errors.append(f"{url} [{'/'.join(headers)}]: HTTP {r.status_code} {r.text[:80]!r}")
-                    if r.status_code in (404, 502, 503, 520, 521, 522, 523, 525, 530):
-                        break  # Adresse nicht erreichbar - naechste URL
-                    continue
-                msg = _parse(r)
-                if "result" not in msg:
-                    errors.append(f"{url}: {str(msg.get('error'))[:120]}")
-                    continue
-                self.url, self.headers = url, headers
-                self.session = r.headers.get("Mcp-Session-Id")
-                try:
-                    self._post(url, headers, {"jsonrpc": "2.0", "method": "notifications/initialized"},
-                               timeout=20)
-                except requests.RequestException:
-                    pass
-                print(f"Facticity verbunden: {url} (Auth: {'/'.join(headers)})")
-                return True
-        raise FacticityError("Keine Verbindung zu Facticity: " + "; ".join(errors[:12]))
+        c = self.credits()
+        if c is None:
+            raise FacticityError("Facticity nicht erreichbar oder API-Key ungültig (get-credits)")
+        print(f"Facticity verbunden, Credits: {c}")
+        return True
 
-    def call(self, tool, args, timeout=120):
-        if not self.url:
-            self.connect()
-        self._id += 1
-        for attempt in range(3):
-            try:
-                r = self._post(self.url, self.headers, {"jsonrpc": "2.0", "id": self._id,
-                                                        "method": "tools/call",
-                                                        "params": {"name": tool, "arguments": args}},
-                               timeout=timeout)
-            except requests.RequestException as ex:
-                if attempt == 2:
-                    raise FacticityError(f"{tool}: {ex}")
-                time.sleep(5 * (attempt + 1))
-                continue
-            if r.status_code in (404, 400) and self.session and attempt == 0:
-                self.url = None  # Session abgelaufen -> neu verbinden
-                self.connect()
-                continue
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(5 * (attempt + 1))
-                continue
-            if r.status_code != 200:
-                raise FacticityError(f"{tool}: HTTP {r.status_code} {r.text[:150]}")
-            msg = _parse(r)
-            if "error" in msg:
-                raise FacticityError(f"{tool}: {str(msg['error'])[:200]}")
-            res = msg.get("result") or {}
-            if res.get("structuredContent"):
-                return res["structuredContent"]
-            for c in res.get("content") or []:
-                if c.get("type") == "text":
-                    try:
-                        return json.loads(c["text"])
-                    except ValueError:
-                        return {"error": c["text"][:300]}
-            return res
-        raise FacticityError(f"{tool}: keine Antwort")
+    def credits(self):
+        try:
+            r = self.s.get(f"{API}/get-credits", timeout=30)
+            if not r.ok:
+                print(f"get-credits Fehler {r.status_code}: {r.text[:200]}")
+                return None
+            return r.json().get("credits_left")
+        except (requests.RequestException, ValueError) as ex:
+            print(f"get-credits Fehler: {ex}")
+            return None
+
+    def status(self, market_id):
+        """Kostenlos. {} wenn die Abfrage fehlschlaegt."""
+        try:
+            r = self.s.get(f"{API}/asp/prediction-insight/{market_id}/status",
+                           params={"source": "polymarket"}, timeout=15)
+            return r.json() if r.ok else {}
+        except (requests.RequestException, ValueError):
+            return {}
+
+    def insight(self, market_id):
+        """(daten, fehler). fehler == QUEUED: Analyse laeuft bei Facticity weiter."""
+        try:
+            r = self.s.post(f"{API}/araistotle-insight/",
+                            json={"polymarket_market_id": str(market_id), "refresh": False},
+                            timeout=90)
+        except requests.Timeout:
+            return None, QUEUED
+        except requests.RequestException as ex:
+            return None, f"Netzwerkfehler: {ex}"
+        if r.status_code in (502, 503, 504):
+            return None, QUEUED
+        if not r.ok:
+            return None, f"Fehler {r.status_code}: {r.text[:150]}"
+        try:
+            data = r.json()
+        except ValueError:
+            return None, f"Ungültige Antwort: {r.text[:150]}"
+        if data.get("araistotle_odds") is None and not data.get("ready"):
+            return None, QUEUED
+        return data, ""
 
 
 def _num(v):
@@ -172,7 +115,13 @@ def _num(v):
 
 def to_answer(d, name):
     """Insight -> gleiches Format wie die Exa-Antworten (fuer Telegram, Log, Orderbuch)."""
+    if isinstance(d.get("insight"), dict):
+        d = {**d["insight"], **d}
     odds = _num(d.get("araistotle_odds"))
+    if odds is None:
+        odds = _num(d.get("araistotle_probability") or d.get("araistotle_prob"))
+    if odds is not None and odds > 1:
+        odds /= 100
     sig = d.get("market_pricing_signal") or {}
     if odds is None:
         odds = _num(sig.get("araistotle_prob"))
@@ -186,7 +135,7 @@ def to_answer(d, name):
     elif mkt is not None:
         signal = "unterbewertet" if p > mkt * 100 else "ueberbewertet"
     else:
-        signal = "unklar"
+        signal = "offen"  # wird in new_markets gegen den Marktpreis gesetzt
     rri = (d.get("rri") or {}).get("score")
     return {
         "antwort": name, "focus": name, "signal": signal, "einschaetzung_prozent": p,
@@ -200,72 +149,67 @@ def to_answer(d, name):
 
 def analyze(items):
     """items: Liste (key, polymarket_market_id, antwort-name).
-    Rueckgabe: ({key: antwort-dict}, info-dict mit credits_left / fehler / neu)."""
+    Rueckgabe: ({key: antwort-dict}, info-dict mit credits_left / fehler / neu / pending_keys)."""
     info = {"credits_left": None, "fehler": "", "neu": 0, "vorhanden": 0, "offen": 0,
             "pending_keys": []}
     out = {}
     if not enabled() or not items:
         return out, info
-    client = Client()
-    try:
-        client.connect()
-    except FacticityError as ex:
-        info["fehler"] = str(ex)
-        print(ex)
+    fc = Client()
+    credits = fc.credits()
+    if credits is None:
+        info["fehler"] = "Facticity nicht erreichbar oder API-Key ungültig"
         return out, info
-    pending = []
+    info["credits_left"] = credits
+    if credits < 2:
+        info["fehler"] = "Zu wenig Facticity-Credits"
+        return out, info
+    waiting = []
     for key, mid, name in items[:MAX_PER_RUN]:
-        try:
-            d = client.call("araistotle_insight", {"polymarket_market_id": str(mid)})
-        except FacticityError as ex:
-            print("ArAIstotle-Fehler:", ex)
-            info["fehler"] = str(ex)
-            if "credit" in str(ex).lower():
-                break
+        st = fc.status(mid)
+        stage = str(st.get("status") or "").lower()
+        if stage == "resolved":
             continue
-        if d.get("credits_left") is not None:
-            info["credits_left"] = d["credits_left"]
-        if d.get("error") or d.get("success") is False:
-            msg = str(d.get("error") or d.get("message") or d)[:200]
-            print(f"ArAIstotle {mid}: {msg}")
-            if "credit" in msg.lower():
-                info["fehler"] = "Zu wenig Facticity-Credits"
-                break
+        was_ready = bool(st.get("ready"))
+        if not was_ready and st.get("exists"):
+            waiting.append((key, mid, name))  # laeuft schon bei Facticity
             continue
-        status = str(d.get("status") or d.get("insight_status") or "").lower()
-        if d.get("ready") or status == "completed":
+        d, err = fc.insight(mid)  # vorhanden: 2 Credits, neu: 10 Credits
+        if not was_ready:
+            info["neu"] += 1
+        if d:
             a = to_answer(d, name)
             if a:
                 out[key] = a
-                info["vorhanden"] += 1
-        elif status in PENDING or d.get("task_id") or not d.get("ready"):
-            pending.append((key, mid, name))
-            info["neu"] += 1
-    # Neue Analysen laufen asynchron -> spaeter nochmal abholen
+                info["vorhanden"] += was_ready
+        elif err == QUEUED:
+            waiting.append((key, mid, name))
+        else:
+            print(f"ArAIstotle {mid}: {err}")
+            if "credit" in err.lower() or " 402" in err:
+                info["fehler"] = "Zu wenig Facticity-Credits"
+                break
+            info["fehler"] = err
+        time.sleep(0.3)
+    # Auf laufende Analysen warten (Status kostenlos, Abholen 2 Credits)
     deadline = time.time() + WAIT
-    while pending and time.time() < deadline:
-        time.sleep(min(60, max(5, deadline - time.time())))
+    while waiting and time.time() < deadline:
+        time.sleep(min(30, max(5, deadline - time.time())))
         still = []
-        for key, mid, name in pending:
-            try:
-                d = client.call("araistotle_insight", {"polymarket_market_id": str(mid)})
-            except FacticityError as ex:
-                print("ArAIstotle-Fehler:", ex)
-                still.append((key, mid, name))
-                continue
-            if d.get("credits_left") is not None:
-                info["credits_left"] = d["credits_left"]
-            status = str(d.get("status") or d.get("insight_status") or "").lower()
-            a = to_answer(d, name) if (d.get("ready") or status == "completed") else None
-            if a:
-                out[key] = a
-            elif status in ("failed", "error", "resolved_skipped"):
-                print(f"ArAIstotle {mid}: {status}")
-            else:
-                still.append((key, mid, name))
-        pending = still
-    info["offen"] = len(pending)
-    info["pending_keys"] = [k for k, _, _ in pending]
+        for key, mid, name in waiting:
+            if fc.status(mid).get("ready"):
+                d, _ = fc.insight(mid)
+                a = to_answer(d, name) if d else None
+                if a:
+                    out[key] = a
+                    continue
+            still.append((key, mid, name))
+        waiting = still
+    info["offen"] = len(waiting)
+    info["pending_keys"] = [k for k, _, _ in waiting]
+    c = fc.credits()
+    if c is not None:
+        info["credits_left"] = c
     print(f"ArAIstotle: {len(out)}/{min(len(items), MAX_PER_RUN)} analysiert "
           f"({info['vorhanden']} vorhanden, {info['neu']} neu angestoßen, {info['offen']} noch offen), "
           f"Credits übrig: {info['credits_left']}")
@@ -276,10 +220,7 @@ if __name__ == "__main__":
     if not API_KEY:
         raise SystemExit("FACTICITY_API_KEY fehlt.")
     mid = sys.argv[1] if len(sys.argv) > 1 else ""
-    c = Client()
-    c.connect()
+    Client().connect()
     if mid:
         res, info = analyze([("test", mid, "Test")])
         print(json.dumps({"ergebnis": res, "info": info}, ensure_ascii=False, indent=2)[:3000])
-    else:
-        print(json.dumps(c.call("get_credits", {}), ensure_ascii=False)[:1000])

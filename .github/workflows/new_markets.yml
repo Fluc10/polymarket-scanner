@@ -38,7 +38,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           FACTICITY_API_KEY: ${{ secrets.FACTICITY_API_KEY }}
-          FACTICITY_MCP_URL: ${{ vars.FACTICITY_MCP_URL }}
           ARAISTOTLE_MAX_PER_RUN: ${{ vars.ARAISTOTLE_MAX_PER_RUN }}
           ARAISTOTLE_WAIT: ${{ vars.ARAISTOTLE_WAIT }}
           ARAISTOTLE_LOW_CREDITS: ${{ vars.ARAISTOTLE_LOW_CREDITS }}

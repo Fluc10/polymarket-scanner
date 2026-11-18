@@ -792,7 +792,11 @@ def run_araistotle(events, state):
     res, info = araistotle.analyze(items)
     by_id = {str(e["id"]): e for e in events}
     for key, a in res.items():
-        by_id[key]["_ara"] = a
+        e = by_id[key]
+        _, price, _ = e.get("_pick") or (None, None, None)
+        if price is not None:
+            set_ara_signal(a, price * 100)
+        e["_ara"] = a
     pend = state.setdefault("ara_pending", {})
     now_iso = datetime.now(timezone.utc).isoformat()
     waiting = set(info.get("pending_keys") or [])
@@ -801,6 +805,15 @@ def run_araistotle(events, state):
             by_id[key]["_ara_pending"] = True
             pend[mid] = {"name": name, "seit": now_iso}
     return info
+
+
+def set_ara_signal(a, mkt):
+    """Signal aus ArAIstotle-% vs. Marktpreis (falls Facticity keinen Marktpreis mitliefert)."""
+    if a.get("marktpreis_prozent") is None:
+        a["marktpreis_prozent"] = round(mkt, 1)
+    if a.get("signal") in ("offen", "unklar", None, ""):
+        d = a["einschaetzung_prozent"] - mkt
+        a["signal"] = "fair" if abs(d) < 2 else ("unterbewertet" if d > 0 else "ueberbewertet")
 
 
 def fill_pending_araistotle(state):
@@ -826,7 +839,8 @@ def fill_pending_araistotle(state):
             a = res.get(str(r.get("market_id")))
             if not a or r.get("ara_prozent"):
                 continue
-            p, mkt = a["einschaetzung_prozent"], float(r.get("markt_prozent") or 0)
+            mkt = float(r.get("markt_prozent") or 0)
+            set_ara_signal(a, mkt)
             book = {k: orderbook_num(r.get(k)) for k in
                     ("ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
                      "einstieg_nein", "gefuellt_nein")}
