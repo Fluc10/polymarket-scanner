@@ -1,5 +1,5 @@
 """
-Trading Competition der Analyse-Tools (Exa, Exa Pro, FutureSearch).
+Trading Competition der Analyse-Tools (Exa, Exa Pro, FutureSearch, Endspurt-Scanner).
 
 Regeln (fuer jedes Tool gleich):
   - Jedes Tool handelt mit TRADE_SIZE $ (Standard 100 $) pro Markt.
@@ -26,9 +26,10 @@ import gsheet
 import orderbook
 
 FS_FILE = os.path.join("data", "futuresearch_log.csv")
+ENDGAME_FILE = os.path.join("data", "endgame_log.csv")
 MIN_EDGE = et.env_float("COMP_MIN_EDGE", 10)
 STAKE = orderbook.TRADE_SIZE
-TOOLS = ["Exa", "Exa Pro", "FutureSearch"]
+TOOLS = ["Exa", "Exa Pro", "FutureSearch", "Exa (Endspurt)", "Exa Pro (Endspurt)"]
 MEDALS = ["🥇", "🥈", "🥉"]
 BOOK_KEYS = ["ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
              "einstieg_nein", "gefuellt_nein"]
@@ -57,7 +58,7 @@ def decide(prob, book):
     return best
 
 
-def collect_trades(log, fs_log):
+def collect_trades(log, fs_log, eg_log=()):
     """Alle Trades und alle verworfenen Signale je Tool."""
     trades, skipped = [], {t: 0 for t in TOOLS}
     sources = []
@@ -72,15 +73,27 @@ def collect_trades(log, fs_log):
         if book["einstieg_ja"] is None and book["einstieg_nein"] is None:
             continue
         sources.append(("FutureSearch", x, et.num(x.get("fs_prozent")), book, x.get("geprueft_am", "")))
+    for x in eg_log:  # Endspurt-Scanner: Maerkte 2-7 Tage vor Ablauf
+        book = {k: et.num(x.get(k)) for k in BOOK_KEYS}
+        if book["einstieg_ja"] is None and book["einstieg_nein"] is None:
+            continue
+        x = dict(x, antwort=x.get("frage") or x.get("antwort"))
+        sources.append(("Exa (Endspurt)", x, et.num(x.get("exa_prozent")), book, x.get("erfasst_am", "")))
+        sources.append(("Exa Pro (Endspurt)", x, et.num(x.get("exa_pro_prozent")), book, x.get("erfasst_am", "")))
+    taken = set()  # pro Tool und Markt nur der erste Trade
 
     for tool, x, prob, book, when in sources:
         if prob is None:
             continue
         d = decide(prob, book)
+        key = (tool, str(x.get("market_id") or ""))
+        if key in taken:
+            continue
         if d.get("grund"):
             if "Edge" in d["grund"]:
                 skipped[tool] += 1
             continue
+        taken.add(key)
         mkt = et.num(x.get("markt_prozent") or x.get("markt_bei_check"))
         trades.append({
             "tool": tool, "zeit": when, "market_id": str(x.get("market_id") or ""),
@@ -258,6 +271,7 @@ def build_tables(trades, board, curve_rows, now):
         "Edge = Wahrscheinlichkeit des Tools für die gekaufte Seite minus echter Durchschnitts-Einstiegspreis aus dem Orderbuch (in Cent).",
         f"Füllung: Es werden nur Orderbuch-Stufen bis {orderbook.FILL_WINDOW:.0f} ¢ über dem besten Ask genutzt. Ist dort weniger als {T} Liquidität, wird nur der gefüllte Betrag gehandelt (Ø Füllung).",
         "Exa und Exa Pro bewerten jeden neuen Markt, FutureSearch nur die 2 Märkte mit dem größten Exa-Delta pro Tag. "
+        "„Endspurt“ = eigene Strategie: Märkte 2–7 Tage vor Ablauf (Ja 15–85 %), geprüft auf schon feststehende, noch nicht eingepreiste Ergebnisse. "
         "Deshalb sind Rendite % und Trefferquote fairer zum Vergleichen als Gesamt $; die Kopf-an-Kopf-Tabelle zeigt nur gemeinsame Märkte.",
         "Gewinnkurve: siehe Diagramm unten und Blatt „Competition Verlauf“.",
     ]:
@@ -266,7 +280,7 @@ def build_tables(trades, board, curve_rows, now):
 
     money_cols = [2, 9, 11, 16, 17]
     comp = {"title": "Competition", "header": None, "rows": rows, "bold_rows": bold,
-            "widths": [10, 16, 16, 12, 9, 9, 10, 10, 12, 13, 13, 14, 14, 10, 11, 11, 13, 14, 16],
+            "widths": [10, 20, 16, 12, 9, 9, 10, 10, 12, 13, 13, 14, 14, 10, 11, 11, 13, 14, 16],
             "posneg_cols": money_cols + [3, 10], "wrap_cols": []}
 
     trade_rows, links = [], []
@@ -291,8 +305,9 @@ def build_tables(trades, board, curve_rows, now):
     curve_tab = {
         "title": "Competition Verlauf",
         "header": ["Datum"] + [f"{x} Gesamt $" for x in TOOLS],
-        "rows": curve_rows, "widths": [12, 16, 16, 16],
-        "num_cols": {1: "0.00", 2: "0.00", 3: "0.00"}, "posneg_cols": [1, 2, 3],
+        "rows": curve_rows, "widths": [12] + [18] * len(TOOLS),
+        "num_cols": {c: "0.00" for c in range(1, len(TOOLS) + 1)},
+        "posneg_cols": list(range(1, len(TOOLS) + 1)),
     }
     return [comp, trades_tab, curve_tab], chart_row, first_board
 
@@ -364,7 +379,7 @@ def main():
         raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
     now = datetime.now(et.TZ)
     log, fs_log = et.read_csv(et.LOG_FILE), et.read_csv(FS_FILE)
-    trades, skipped = collect_trades(log, fs_log)
+    trades, skipped = collect_trades(log, fs_log, et.read_csv(ENDGAME_FILE))
     if not trades:
         et.send(f"🏆 <b>Trading Competition</b>\nNoch keine Trades – kein Signal hatte bisher eine Edge "
                 f"≥ {MIN_EDGE:.0f} ¢ nach Einstiegspreis (verworfen: "
