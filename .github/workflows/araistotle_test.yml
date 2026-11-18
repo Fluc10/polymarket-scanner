@@ -21,6 +21,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests
+      - name: Facticity-Endpunkte suchen (kostenlos)
+        env:
+          FACTICITY_API_KEY: ${{ secrets.FACTICITY_API_KEY }}
+        run: python facticity_discover.py
+
       - name: Verbindung zu Facticity testen
         env:
           FACTICITY_API_KEY: ${{ secrets.FACTICITY_API_KEY }}
