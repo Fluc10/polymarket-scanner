@@ -354,7 +354,8 @@ def main():
         if len(chosen) >= FS_PER_DAY:
             break
 
-    state["last_run"] = today
+    if not FS_FORCE:  # manuelle Testlaeufe blockieren den automatischen 18-Uhr-Lauf nicht
+        state["last_run"] = today
     if not chosen:
         save_state(state)
         send(f"🔮 <b>FutureSearch-Check {now:%d.%m.}</b>\nKeine neuen Märkte mit Exa-Delta in den letzten {FS_HOURS:.0f} h.")

@@ -319,7 +319,8 @@ def finish_sheet(chart_row, n_curve):
     meta = sh.fetch_sheet_metadata({"fields": "sheets(properties(sheetId,title,index),charts(chartId))"})
     sheets = sorted(meta.get("sheets", []), key=lambda s: s["properties"]["index"])
     ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
-    ours = [t for t in ("Competition", "Tool-Vergleich", "Competition Trades", "Competition Verlauf") if t in ids]
+    ours = [t for t in ("Competition", "Tool-Vergleich", "Prognosen", "Competition Trades",
+                        "Competition Verlauf") if t in ids]
     others = [s["properties"]["title"] for s in sheets if s["properties"]["title"] not in ours]
     req = []
     for i, title in enumerate(others + ours):
@@ -355,24 +356,26 @@ def collect_forecasts(log, fs_log, eg_log):
     Pro Tool und Markt zaehlt die erste Prognose."""
     out, seen = [], set()
 
-    def add(tool, x, prob, mkt):
+    def add(tool, x, prob, mkt, when=""):
         key = (tool, str(x.get("market_id") or ""))
         if prob is None or mkt is None or not key[1] or key in seen:
             return
         seen.add(key)
-        out.append({"tool": tool, "market_id": key[1], "prob": prob, "markt": mkt,
-                    "event": x.get("event") or x.get("frage") or "", "slug": x.get("event_slug", "")})
+        out.append({"tool": tool, "market_id": key[1], "prob": prob, "markt": mkt, "zeit": when,
+                    "event": x.get("event") or x.get("frage") or "", "slug": x.get("event_slug", ""),
+                    "antwort": x.get("frage") if tool.endswith("(Endspurt)") else (x.get("antwort") or "Ja")})
 
     for x in log:
         mkt = et.num(x.get("markt_prozent"))
-        add("Exa", x, et.num(x.get("exa_prozent")), mkt)
-        add("Exa Pro", x, et.num(x.get("exa_pro_prozent")), mkt)
+        add("Exa", x, et.num(x.get("exa_prozent")), mkt, x.get("erfasst_am", ""))
+        add("Exa Pro", x, et.num(x.get("exa_pro_prozent")), mkt, x.get("erfasst_am", ""))
     for x in fs_log:
-        add("FutureSearch", x, et.num(x.get("fs_prozent")), et.num(x.get("markt_bei_check")))
+        add("FutureSearch", x, et.num(x.get("fs_prozent")), et.num(x.get("markt_bei_check")),
+            x.get("geprueft_am", ""))
     for x in eg_log:
         mkt = et.num(x.get("markt_prozent"))
-        add("Exa (Endspurt)", x, et.num(x.get("exa_prozent")), mkt)
-        add("Exa Pro (Endspurt)", x, et.num(x.get("exa_pro_prozent")), mkt)
+        add("Exa (Endspurt)", x, et.num(x.get("exa_prozent")), mkt, x.get("erfasst_am", ""))
+        add("Exa Pro (Endspurt)", x, et.num(x.get("exa_pro_prozent")), mkt, x.get("erfasst_am", ""))
     return out
 
 
@@ -461,6 +464,49 @@ def comparison_tab(fc, outcomes, fs_log, now):
     return tab, acc
 
 
+def forecasts_tab(fc, outcomes, markets):
+    """Jede einzelne Prognose: Wahrscheinlichkeit, Entwicklung seit der Prognose, Ergebnis."""
+    rows, links = [], []
+    for f in sorted(fc, key=lambda f: f["zeit"], reverse=True):
+        m = markets.get(f["market_id"])
+        p = et.yes_price(m) if m else None
+        now_p = None if p is None else round(p * 100, 1)
+        o = outcomes.get(f["market_id"])
+        diff = round(f["prob"] - f["markt"], 1)
+        move = gap = toward = None
+        if o is None and now_p is not None:
+            move = round(now_p - f["markt"], 1)
+            gap = round(f["prob"] - now_p, 1)
+            if abs(diff) < 0.5 or abs(move) < 1:
+                toward = "unverändert"
+            else:
+                toward = "ja" if (move > 0) == (diff > 0) else "nein"
+        if o is not None:
+            status = "aufgelöst: JA" if o == 1 else "aufgelöst: NEIN"
+            right = "ja" if (f["prob"] >= 50) == (o == 1) else "nein"
+            closer = "" if abs(diff) < 0.5 else (
+                "ja" if abs(o * 100 - f["prob"]) < abs(o * 100 - f["markt"]) else "nein")
+        else:
+            status = "geschlossen" if m and m.get("closed") else "offen"
+            right = closer = ""
+        rows.append([f["zeit"], f["tool"], f["event"], f["antwort"], round(f["prob"], 1), round(f["markt"], 1),
+                     diff, now_p if o is None else (100.0 if o == 1 else 0.0), move, toward, gap, status,
+                     right, closer])
+        links.append(f"https://polymarket.com/event/{f['slug']}" if f["slug"] else "")
+    pp = "+0.0;-0.0;0.0"
+    return {
+        "title": "Prognosen",
+        "header": ["Prognose am", "Tool", "Event", "Antwort / Frage", "Tool %", "Markt bei Prognose %",
+                   "Tool − Markt PP", "Markt jetzt %", "Bewegung seit Prognose PP", "Bewegt sich zum Tool hin?",
+                   "Abstand Tool − Markt jetzt PP", "Status", "Vorhersage richtig? (Tool ≥ 50 % = Ja)",
+                   "Besser als der Markt?"],
+        "rows": rows, "links": links, "link_col": 2,
+        "widths": [16, 16, 44, 30, 9, 12, 11, 11, 13, 14, 14, 15, 18, 14],
+        "num_cols": {4: "0.0", 5: "0.0", 6: pp, 7: "0.0", 8: pp, 10: pp},
+        "posneg_cols": [8], "yesno_cols": [9, 12, 13], "wrap_cols": [],
+    }
+
+
 def outcomes_for(ids):
     markets = et.fetch_markets(ids) if ids else {}
     out = {}
@@ -519,6 +565,7 @@ def main():
     _, curve_rows = equity_curve(trades, snaps_by, now.strftime("%Y-%m-%d"))
     tabs, chart_row, _ = build_tables(trades, board, curve_rows, now)
     tabs.insert(1, cmp_tab)
+    tabs.insert(2, forecasts_tab(fc, outcomes, markets))
 
     url = ""
     if gsheet.enabled():
