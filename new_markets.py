@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import araistotle
 import orderbook
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -370,9 +371,9 @@ def attach_books(events):
             e["_book"] = b
 
 
-def trade_short(e):
+def trade_short(e, key="_exa"):
     """Telegram-Zeile mit echtem Einstiegspreis."""
-    t = trade_info(e)
+    t = trade_info(e, key)
     if not t:
         return ""
     side = "Ja" if t["richtung"] == "ja" else "Nein"
@@ -488,6 +489,13 @@ def event_line(e, now):
     ts = trade_short(e)
     if ts:
         line += "\n   " + ts
+    if e.get("_ara"):
+        line += "\n   " + exa_short(e["_ara"], "ArAIstotle", reason_len=150)
+        ta = trade_short(e, "_ara")
+        if ta:
+            line += "\n   " + ta
+    elif e.get("_ara_pending"):
+        line += "\n   ⏳ ArAIstotle-Analyse läuft – Ergebnis kommt in die Tabelle"
     return line
 
 
@@ -647,6 +655,9 @@ LOG_FIELDS = [
     # Vergleichsmodell (z. B. exa-pro) auf derselben Antwort
     "modell", "modell_pro", "exa_pro_prozent", "delta_pro_pp", "signal_pro", "begruendung_pro",
     "richtung_pro", "einstieg_pro", "edge_pro_pp", "handelbar_pro", "kosten_exa", "kosten_pro",
+    # ArAIstotle (Facticity) auf derselben Antwort
+    "ara_prozent", "ara_markt_prozent", "delta_ara_pp", "signal_ara", "begruendung_ara",
+    "richtung_ara", "einstieg_ara", "edge_ara_pp", "handelbar_ara", "ara_rri", "ara_credits",
 ]
 
 
@@ -742,8 +753,101 @@ def log_markets(events, now):
             "handelbar_pro": "" if not t2 else ("ja" if t2["handelbar"] else "nein"),
             "kosten_exa": "" if not a or a.get("kosten") is None else a.get("kosten"),
             "kosten_pro": "" if not a2 or a2.get("kosten") is None else a2.get("kosten"),
+            **ara_fields(e, mkt),
         })
     orderbook.csv_append(LOG_FILE, LOG_FIELDS, rows)
+
+
+def ara_fields(e, mkt):
+    """Log-Spalten fuer ArAIstotle."""
+    a = e.get("_ara") or {}
+    p = exa_prob(e, "_ara")
+    t = trade_info(e, "_ara") or {}
+    blank = lambda v: "" if v is None else v
+    return {
+        "ara_prozent": "" if p is None else round(p, 1),
+        "ara_markt_prozent": blank(a.get("marktpreis_prozent")),
+        "delta_ara_pp": "" if p is None else round(p - mkt, 1),
+        "signal_ara": a.get("signal", "") if a else "",
+        "begruendung_ara": a.get("begruendung", "") if a else "",
+        "richtung_ara": t.get("richtung", ""),
+        "einstieg_ara": blank(t.get("einstieg")),
+        "edge_ara_pp": blank(t.get("edge")),
+        "handelbar_ara": "" if not t else ("ja" if t["handelbar"] else "nein"),
+        "ara_rri": blank(a.get("rri")),
+        "ara_credits": blank(a.get("credits")),
+    }
+
+
+def run_araistotle(events, state):
+    """ArAIstotle fuer jede neue Antwort (dieselbe wie Exa). Neue Analysen, die bis
+    zum Ende der Wartezeit nicht fertig sind, werden im naechsten Lauf nachgetragen."""
+    if not araistotle.enabled():
+        return {}
+    items = []
+    for e in sorted(events, key=lambda x: -float(x.get("volume") or 0)):
+        m = (e.get("_pick") or (None,))[0]
+        if m and m.get("id"):
+            items.append((str(e["id"]), str(m["id"]), m.get("groupItemTitle") or "Ja"))
+    res, info = araistotle.analyze(items)
+    by_id = {str(e["id"]): e for e in events}
+    for key, a in res.items():
+        by_id[key]["_ara"] = a
+    pend = state.setdefault("ara_pending", {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    waiting = set(info.get("pending_keys") or [])
+    for key, mid, name in items:
+        if key in waiting:
+            by_id[key]["_ara_pending"] = True
+            pend[mid] = {"name": name, "seit": now_iso}
+    return info
+
+
+def fill_pending_araistotle(state):
+    """Im letzten Lauf angestossene ArAIstotle-Analysen abholen und im Protokoll nachtragen."""
+    pend = state.get("ara_pending") or {}
+    if not pend or not araistotle.enabled():
+        return {}
+    limit = datetime.now(timezone.utc) - timedelta(days=2)
+    pend = {k: v for k, v in pend.items() if (parse_time(v.get("seit")) or limit) > limit}
+    res, info = araistotle.analyze([(mid, mid, v.get("name") or "Ja") for mid, v in pend.items()])
+    if res:
+        import csv
+        try:
+            with open(LOG_FILE, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fields, rows = reader.fieldnames or LOG_FIELDS, list(reader)
+        except FileNotFoundError:
+            fields, rows = LOG_FIELDS, []
+        for k in LOG_FIELDS:
+            if k not in fields:
+                fields.append(k)
+        for r in rows:
+            a = res.get(str(r.get("market_id")))
+            if not a or r.get("ara_prozent"):
+                continue
+            p, mkt = a["einschaetzung_prozent"], float(r.get("markt_prozent") or 0)
+            book = {k: orderbook_num(r.get(k)) for k in
+                    ("ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
+                     "einstieg_nein", "gefuellt_nein")}
+            fake = {"_pick": ({"id": r.get("market_id")}, mkt / 100, True), "_ara": a,
+                    "_book": book if book.get("einstieg_ja") is not None or book.get("einstieg_nein") is not None
+                    else None, "markets": [{}]}
+            r.update(ara_fields(fake, mkt))
+        with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        print(f"ArAIstotle: {len(res)} Analysen aus dem letzten Lauf nachgetragen")
+    state["ara_pending"] = {k: v for k, v in pend.items() if k not in res}
+    return info
+
+
+def orderbook_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------- State
@@ -801,7 +905,16 @@ def main():
     # Gemeldete Events 30 Tage merken
     keep_after = now - timedelta(days=30)
     seen = {k: v for k, v in seen.items() if (parse_time(v) or now) >= keep_after}
-    save_state({"initialized": True, "seen": seen})
+    state.update({"initialized": True, "seen": seen})
+    save_state(state)
+
+    # ArAIstotle-Analysen aus dem letzten Lauf nachtragen (sind inzwischen fertig)
+    ara_info = {}
+    try:
+        ara_info = fill_pending_araistotle(state)
+    except Exception as ex:
+        print("ArAIstotle-Nachtrag fehlgeschlagen:", ex)
+    save_state(state)
 
     if not fresh:
         print(f"Keine neuen Events (geprüft: {len(events)})")
@@ -809,6 +922,11 @@ def main():
 
     analyze_all(fresh)
     attach_books(fresh)
+    try:
+        ara_info = run_araistotle(fresh, state) or ara_info
+    except Exception as ex:
+        print("ArAIstotle-Fehler:", ex)
+    save_state(state)
     log_markets(fresh, now)
 
     # Google Sheet sofort mit den neuen Maerkten aktualisieren (Fehler stoppen den Alarm nicht)
@@ -837,6 +955,13 @@ def main():
     title = "Neue Märkte der letzten" if first_run else "Neue Märkte"
     header = (f"🆕 <b>{title} {MAX_AGE_HOURS:.0f}h</b> ({now_local})" if first_run
               else f"🆕 <b>{title}</b> ab {money(MIN_VOLUME)} Volumen ({now_local})")
+    credits = ara_info.get("credits_left")
+    if ara_info.get("fehler") and "credit" in ara_info["fehler"].lower():
+        header += "\n🚨 <b>Facticity-Credits leer</b> – ArAIstotle analysiert nicht mehr. Aufladen auf app.facticity.ai"
+    elif credits is not None and credits < araistotle.LOW_CREDITS:
+        header += f"\n⚠️ Facticity-Credits fast leer: noch {credits:.0f} (neue Analyse = 10)"
+    elif ara_info.get("fehler") and not any(e.get("_ara") for e in fresh):
+        header += f"\n⚠️ ArAIstotle nicht erreichbar: {escape(ara_info['fehler'][:150])}"
     send_blocks(header + sheet_link, blocks)
 
     stamp = now.astimezone(TZ).strftime("%Y-%m-%d_%H%M")

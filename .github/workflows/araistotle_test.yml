@@ -1,0 +1,30 @@
+name: ArAIstotle-Verbindungstest
+
+on:
+  workflow_dispatch:
+    inputs:
+      market_id:
+        description: "Polymarket-Market-ID zum Testen (leer = nur Credits abfragen, kostenlos)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Verbindung zu Facticity testen
+        env:
+          FACTICITY_API_KEY: ${{ secrets.FACTICITY_API_KEY }}
+          FACTICITY_MCP_URL: ${{ vars.FACTICITY_MCP_URL }}
+          ARAISTOTLE_WAIT: "180"
+          MARKET_ID: ${{ github.event.inputs.market_id }}
+        run: python araistotle.py "$MARKET_ID"

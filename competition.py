@@ -1,5 +1,5 @@
 """
-Trading Competition der Analyse-Tools (Exa, Exa Pro, FutureSearch, Endspurt-Scanner).
+Trading Competition der Analyse-Tools (Exa, Exa Pro, ArAIstotle, FutureSearch, Endspurt-Scanner).
 
 Regeln (fuer jedes Tool gleich):
   - Jedes Tool handelt mit TRADE_SIZE $ (Standard 100 $) pro Markt.
@@ -8,7 +8,7 @@ Regeln (fuer jedes Tool gleich):
   - Gekauft wird die Seite (Ja oder Nein), die das Tool als unterbewertet sieht.
   - Gefuellt wird nur ueber Orderbuch-Stufen bis FILL_WINDOW Cent (Standard 5 ¢) ueber dem
     besten Ask. Reicht die Tiefe nicht fuer 100 $, wird nur der gefuellte Betrag gehandelt.
-  - Exa und Exa Pro handeln zum Orderbuch bei Erfassung des Markts,
+  - Exa, Exa Pro und ArAIstotle handeln zum Orderbuch bei Erfassung des Markts,
     FutureSearch zum Orderbuch beim taeglichen Check (18 Uhr).
   - Positionen werden bis zur Aufloesung gehalten. Offene Positionen werden zum
     aktuellen besten Bid bewertet (Wert bei Verkauf jetzt).
@@ -29,7 +29,7 @@ FS_FILE = os.path.join("data", "futuresearch_log.csv")
 ENDGAME_FILE = os.path.join("data", "endgame_log.csv")
 MIN_EDGE = et.env_float("COMP_MIN_EDGE", 10)
 STAKE = orderbook.TRADE_SIZE
-TOOLS = ["Exa", "Exa Pro", "FutureSearch", "Exa (Endspurt)", "Exa Pro (Endspurt)"]
+TOOLS = ["Exa", "Exa Pro", "ArAIstotle", "FutureSearch", "Exa (Endspurt)", "Exa Pro (Endspurt)"]
 MEDALS = ["🥇", "🥈", "🥉"]
 SIG_PP = et.env_float("TRACKER_MIN_DELTA", 5)  # ab diesem Abstand zum Markt zaehlt eine Richtungsprognose
 BOOK_KEYS = ["ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
@@ -69,6 +69,7 @@ def collect_trades(log, fs_log, eg_log=()):
             continue  # alter Eintrag ohne Orderbuch
         sources.append(("Exa", x, et.num(x.get("exa_prozent")), book, x.get("erfasst_am", "")))
         sources.append(("Exa Pro", x, et.num(x.get("exa_pro_prozent")), book, x.get("erfasst_am", "")))
+        sources.append(("ArAIstotle", x, et.num(x.get("ara_prozent")), book, x.get("erfasst_am", "")))
     for x in fs_log:
         book = {k: et.num(x.get(k)) for k in BOOK_KEYS}
         if book["einstieg_ja"] is None and book["einstieg_nein"] is None:
@@ -271,7 +272,7 @@ def build_tables(trades, board, curve_rows, now):
         "Gesamt $ = realisierter Gewinn aufgelöster Märkte + Wert offener Positionen, wenn man sie jetzt zum besten Bid verkaufen würde.",
         "Edge = Wahrscheinlichkeit des Tools für die gekaufte Seite minus echter Durchschnitts-Einstiegspreis aus dem Orderbuch (in Cent).",
         f"Füllung: Es werden nur Orderbuch-Stufen bis {orderbook.FILL_WINDOW:.0f} ¢ über dem besten Ask genutzt. Ist dort weniger als {T} Liquidität, wird nur der gefüllte Betrag gehandelt (Ø Füllung).",
-        "Exa und Exa Pro bewerten jeden neuen Markt, FutureSearch nur die 2 Märkte mit dem größten Exa-Delta pro Tag. "
+        "Exa, Exa Pro und ArAIstotle bewerten jeden neuen Markt, FutureSearch nur die 2 Märkte mit dem größten Exa-Delta pro Tag. "
         "„Endspurt“ = eigene Strategie: Märkte 2–7 Tage vor Ablauf (Ja 15–85 %), geprüft auf schon feststehende, noch nicht eingepreiste Ergebnisse. "
         "Deshalb sind Rendite % und Trefferquote fairer zum Vergleichen als Gesamt $; die Kopf-an-Kopf-Tabelle zeigt nur gemeinsame Märkte.",
         "Gewinnkurve: siehe Diagramm unten und Blatt „Competition Verlauf“.",
@@ -369,6 +370,7 @@ def collect_forecasts(log, fs_log, eg_log):
         mkt = et.num(x.get("markt_prozent"))
         add("Exa", x, et.num(x.get("exa_prozent")), mkt, x.get("erfasst_am", ""))
         add("Exa Pro", x, et.num(x.get("exa_pro_prozent")), mkt, x.get("erfasst_am", ""))
+        add("ArAIstotle", x, et.num(x.get("ara_prozent")), mkt, x.get("erfasst_am", ""))
     for x in fs_log:
         add("FutureSearch", x, et.num(x.get("fs_prozent")), et.num(x.get("markt_bei_check")),
             x.get("geprueft_am", ""))
@@ -407,11 +409,16 @@ def accuracy(fc, outcomes):
     return rows
 
 
-def head_to_head(fs_log, outcomes):
-    """Gleiche Maerkte, gleicher Zeitpunkt: alle vom FutureSearch-Check geprueften Maerkte."""
-    names = [("Markt", "markt_bei_check"), ("Exa", "exa_prozent"), ("Exa Pro", "exa_pro_prozent"),
-             ("FutureSearch", "fs_prozent")]
-    res = [(x, outcomes[str(x.get("market_id"))]) for x in fs_log if str(x.get("market_id")) in outcomes]
+def head_to_head(fs_log, outcomes, names=None):
+    """Gleiche Maerkte, gleicher Zeitpunkt (Standard: alle vom FutureSearch-Check geprueften Maerkte)."""
+    names = names or [("Markt", "markt_bei_check"), ("Exa", "exa_prozent"), ("Exa Pro", "exa_pro_prozent"),
+                      ("FutureSearch", "fs_prozent")]
+    seen, res = set(), []
+    for x in fs_log:
+        mid = str(x.get("market_id"))
+        if mid in outcomes and mid not in seen:
+            seen.add(mid)
+            res.append((x, outcomes[mid]))
     full = [(x, o) for x, o in res if all(et.num(x.get(k)) is not None for _, k in names)]
     rows = []
     for name, key in names:
@@ -425,7 +432,7 @@ def head_to_head(fs_log, outcomes):
     return rows, len(full)
 
 
-def comparison_tab(fc, outcomes, fs_log, now):
+def comparison_tab(fc, outcomes, fs_log, now, log=()):
     acc = accuracy(fc, outcomes)
     rows, bold = [], []
     bold.append(len(rows))
@@ -447,6 +454,15 @@ def comparison_tab(fc, outcomes, fs_log, now):
     bold.append(len(rows))
     rows.append(["Quelle", "Märkte", "Brier-Score", "Am nächsten am Ergebnis (Anzahl)"])
     rows.extend(h2h)
+    rows.append([])
+    new_names = [("Markt", "markt_prozent"), ("Exa", "exa_prozent"), ("Exa Pro", "exa_pro_prozent"),
+                 ("ArAIstotle", "ara_prozent")]
+    h2h_new, n_new = head_to_head(log, outcomes, new_names)
+    bold.append(len(rows))
+    rows.append([f"Kopf-an-Kopf auf allen neuen Märkten (Exa, Exa Pro und ArAIstotle haben dieselbe Antwort bewertet, aufgelöst: {n_new})"])
+    bold.append(len(rows))
+    rows.append(["Quelle", "Märkte", "Brier-Score", "Am nächsten am Ergebnis (Anzahl)"])
+    rows.extend(h2h_new)
     rows.append([])
     bold.append(len(rows))
     rows.append(["Erklärung"])
@@ -557,7 +573,7 @@ def main():
     # Treffsicherheit aller Prognosen (auch ohne Trade)
     fc = collect_forecasts(log, fs_log, eg_log)
     outcomes, markets = outcomes_for({f["market_id"] for f in fc} | {t["market_id"] for t in trades})
-    cmp_tab, acc = comparison_tab(fc, outcomes, fs_log, now)
+    cmp_tab, acc = comparison_tab(fc, outcomes, fs_log, now, log)
 
     snaps_by = snapshot_index(et.read_csv(et.SNAP_FILE))
     evaluate(trades, markets, snaps_by)
