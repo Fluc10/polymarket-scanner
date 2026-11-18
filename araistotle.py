@@ -9,7 +9,7 @@ Neue Analysen laufen asynchron - wir fragen nach ARAISTOTLE_WAIT Sekunden erneut
 
 Secret:   FACTICITY_API_KEY
 Variablen (optional):
-  FACTICITY_MCP_URL        eigene Server-Adresse (Standard: https://mcp.facticity.ai/mcp)
+  FACTICITY_MCP_URL        eigene Server-Adresse (sonst werden bekannte Adressen probiert)
   ARAISTOTLE_MAX_PER_RUN   max. Maerkte pro Lauf (Standard 20)
   ARAISTOTLE_WAIT          max. Wartezeit auf neue Analysen in Sekunden (Standard 300)
   ARAISTOTLE_LOW_CREDITS   Warnung ab diesem Guthaben (Standard 60)
@@ -25,7 +25,8 @@ import requests
 
 API_KEY = os.environ.get("FACTICITY_API_KEY", "").strip()
 URLS = [u for u in [os.environ.get("FACTICITY_MCP_URL", "").strip(),
-                    "https://mcp.facticity.ai/mcp", "https://mcp.facticity.ai/"] if u]
+                    "https://api.facticity.ai/mcp", "https://mcp.facticity.ai/mcp",
+                    "https://mcp.facticity.ai/", "https://facticityai--ai-seer.run.tools/mcp"] if u]
 
 
 def _int(name, default):
@@ -103,7 +104,9 @@ class Client:
                     errors.append(f"{url}: {type(ex).__name__}")
                     break
                 if r.status_code != 200:
-                    errors.append(f"{url} [{'/'.join(headers)}]: HTTP {r.status_code}")
+                    errors.append(f"{url} [{'/'.join(headers)}]: HTTP {r.status_code} {r.text[:80]!r}")
+                    if r.status_code in (404, 502, 503, 520, 521, 522, 523, 525, 530):
+                        break  # Adresse nicht erreichbar - naechste URL
                     continue
                 msg = _parse(r)
                 if "result" not in msg:
@@ -118,7 +121,7 @@ class Client:
                     pass
                 print(f"Facticity verbunden: {url} (Auth: {'/'.join(headers)})")
                 return True
-        raise FacticityError("Keine Verbindung zu Facticity: " + "; ".join(errors[:6]))
+        raise FacticityError("Keine Verbindung zu Facticity: " + "; ".join(errors[:12]))
 
     def call(self, tool, args, timeout=120):
         if not self.url:
