@@ -1,10 +1,9 @@
 name: Polymarket Scan
 
 on:
-  schedule:
-    # Einmal täglich um 07:43 UTC (= 08:43 Wiener Winterzeit). Anpassen nach Wunsch.
-    - cron: "43 7 * * *"
-  workflow_dispatch:   # Manuell starten über "Run workflow"
+  # Täglicher Lauf abgeschaltet (18.11.2026): ersetzt durch den Endspurt-Scanner (endgame.yml).
+  # Bei Bedarf weiterhin manuell über "Run workflow" startbar.
+  workflow_dispatch:
 
 jobs:
   scan:
