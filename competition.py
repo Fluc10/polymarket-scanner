@@ -31,6 +31,7 @@ MIN_EDGE = et.env_float("COMP_MIN_EDGE", 10)
 STAKE = orderbook.TRADE_SIZE
 TOOLS = ["Exa", "Exa Pro", "FutureSearch", "Exa (Endspurt)", "Exa Pro (Endspurt)"]
 MEDALS = ["🥇", "🥈", "🥉"]
+SIG_PP = et.env_float("TRACKER_MIN_DELTA", 5)  # ab diesem Abstand zum Markt zaehlt eine Richtungsprognose
 BOOK_KEYS = ["ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
              "einstieg_nein", "gefuellt_nein"]
 
@@ -318,7 +319,7 @@ def finish_sheet(chart_row, n_curve):
     meta = sh.fetch_sheet_metadata({"fields": "sheets(properties(sheetId,title,index),charts(chartId))"})
     sheets = sorted(meta.get("sheets", []), key=lambda s: s["properties"]["index"])
     ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
-    ours = ["Competition", "Competition Trades", "Competition Verlauf"]
+    ours = [t for t in ("Competition", "Tool-Vergleich", "Competition Trades", "Competition Verlauf") if t in ids]
     others = [s["properties"]["title"] for s in sheets if s["properties"]["title"] not in ours]
     req = []
     for i, title in enumerate(others + ours):
@@ -345,6 +346,132 @@ def finish_sheet(chart_row, n_curve):
                 "anchorCell": {"sheetId": ids["Competition"], "rowIndex": chart_row, "columnIndex": 0},
                 "widthPixels": 900, "heightPixels": 380}}}}})
     sh.batch_update({"requests": req})
+
+
+# ---------------------------------------------------------------- Tool-Vergleich (Treffsicherheit)
+
+def collect_forecasts(log, fs_log, eg_log):
+    """Alle Prognosen je Tool: (tool, market_id, tool %, markt % zum selben Zeitpunkt, slug, event).
+    Pro Tool und Markt zaehlt die erste Prognose."""
+    out, seen = [], set()
+
+    def add(tool, x, prob, mkt):
+        key = (tool, str(x.get("market_id") or ""))
+        if prob is None or mkt is None or not key[1] or key in seen:
+            return
+        seen.add(key)
+        out.append({"tool": tool, "market_id": key[1], "prob": prob, "markt": mkt,
+                    "event": x.get("event") or x.get("frage") or "", "slug": x.get("event_slug", "")})
+
+    for x in log:
+        mkt = et.num(x.get("markt_prozent"))
+        add("Exa", x, et.num(x.get("exa_prozent")), mkt)
+        add("Exa Pro", x, et.num(x.get("exa_pro_prozent")), mkt)
+    for x in fs_log:
+        add("FutureSearch", x, et.num(x.get("fs_prozent")), et.num(x.get("markt_bei_check")))
+    for x in eg_log:
+        mkt = et.num(x.get("markt_prozent"))
+        add("Exa (Endspurt)", x, et.num(x.get("exa_prozent")), mkt)
+        add("Exa Pro (Endspurt)", x, et.num(x.get("exa_pro_prozent")), mkt)
+    return out
+
+
+def accuracy(fc, outcomes):
+    """Treffsicherheit je Tool im Vergleich zum Marktpreis zum selben Zeitpunkt."""
+    rows = []
+    for tool in TOOLS:
+        fs = [f for f in fc if f["tool"] == tool]
+        res = [(f, outcomes[f["market_id"]]) for f in fs if f["market_id"] in outcomes]
+        n = len(res)
+        if n:
+            b_tool = sum((f["prob"] / 100 - o) ** 2 for f, o in res) / n
+            b_mkt = sum((f["markt"] / 100 - o) ** 2 for f, o in res) / n
+            closer = [abs(o * 100 - f["prob"]) < abs(o * 100 - f["markt"]) for f, o in res
+                      if abs(f["prob"] - f["markt"]) >= 0.5]
+            sig = [(f, o) for f, o in res if abs(f["prob"] - f["markt"]) >= SIG_PP]
+            right = sum(1 for f, o in sig if (f["prob"] > f["markt"]) == (o == 1))
+            err = sum(abs(o * 100 - f["prob"]) for f, o in res) / n
+        rows.append({
+            "tool": tool, "prognosen": len(fs), "aufgeloest": n,
+            "brier": round(b_tool, 4) if n else None, "brier_markt": round(b_mkt, 4) if n else None,
+            "vorsprung": round(b_mkt - b_tool, 4) if n else None,
+            "naeher": f"{sum(closer)} von {len(closer)} ({et.pct(sum(closer), len(closer))})" if n and closer else "–",
+            "naeher_q": (100 * sum(closer) / len(closer)) if n and closer else None,
+            "richtung": f"{right} von {len(sig)} ({et.pct(right, len(sig))})" if n and sig else "–",
+            "fehler": round(err, 1) if n else None,
+            "abweichung": round(sum(abs(f["prob"] - f["markt"]) for f in fs) / len(fs), 1) if fs else None,
+        })
+    return rows
+
+
+def head_to_head(fs_log, outcomes):
+    """Gleiche Maerkte, gleicher Zeitpunkt: alle vom FutureSearch-Check geprueften Maerkte."""
+    names = [("Markt", "markt_bei_check"), ("Exa", "exa_prozent"), ("Exa Pro", "exa_pro_prozent"),
+             ("FutureSearch", "fs_prozent")]
+    res = [(x, outcomes[str(x.get("market_id"))]) for x in fs_log if str(x.get("market_id")) in outcomes]
+    full = [(x, o) for x, o in res if all(et.num(x.get(k)) is not None for _, k in names)]
+    rows = []
+    for name, key in names:
+        if not full:
+            rows.append([name, 0, "–", "–"])
+            continue
+        br = sum((et.num(x.get(key)) / 100 - o) ** 2 for x, o in full) / len(full)
+        wins = sum(1 for x, o in full
+                   if min(names, key=lambda nk: abs(o * 100 - et.num(x.get(nk[1]))))[0] == name)
+        rows.append([name, len(full), round(br, 4), wins])
+    return rows, len(full)
+
+
+def comparison_tab(fc, outcomes, fs_log, now):
+    acc = accuracy(fc, outcomes)
+    rows, bold = [], []
+    bold.append(len(rows))
+    rows.append([f"🎯 Tool-Vergleich: Wer sagt Märkte am besten voraus? – Stand {now:%d.%m.%Y %H:%M}"])
+    rows.append(["Unabhängig vom Handeln: jede Prognose zählt, auch ohne Trade. Verglichen wird immer mit dem "
+                 "Marktpreis zum selben Zeitpunkt."])
+    rows.append([])
+    bold.append(len(rows))
+    rows.append(["Tool", "Prognosen", "davon aufgelöst", "Brier Tool", "Brier Markt (gleiche Märkte)",
+                 "Vorsprung vor Markt", "Näher am Ergebnis als Markt", f"Richtung richtig (≥ {SIG_PP:.0f} PP Abstand)",
+                 "Ø Fehler PP", "Ø Abstand zum Markt PP"])
+    for r in sorted(acc, key=lambda r: (r["vorsprung"] is None, -(r["vorsprung"] or 0))):
+        rows.append([r["tool"], r["prognosen"], r["aufgeloest"], r["brier"], r["brier_markt"], r["vorsprung"],
+                     r["naeher"], r["richtung"], r["fehler"], r["abweichung"]])
+    rows.append([])
+    h2h, n_full = head_to_head(fs_log, outcomes)
+    bold.append(len(rows))
+    rows.append([f"Kopf-an-Kopf auf denselben Märkten (vom FutureSearch-Check geprüft, aufgelöst: {n_full})"])
+    bold.append(len(rows))
+    rows.append(["Quelle", "Märkte", "Brier-Score", "Am nächsten am Ergebnis (Anzahl)"])
+    rows.extend(h2h)
+    rows.append([])
+    bold.append(len(rows))
+    rows.append(["Erklärung"])
+    for t in [
+        "Brier-Score = mittlerer quadratischer Fehler der Wahrscheinlichkeit (0 = perfekt, 0,25 = Münzwurf). Kleiner ist besser.",
+        "Vorsprung vor Markt = Brier Markt minus Brier Tool auf denselben Märkten. Positiv = das Tool war besser als der Marktpreis – nur dann lohnt es sich, ihm zu folgen.",
+        "Näher am Ergebnis: Bei wie vielen aufgelösten Märkten lag die Zahl des Tools näher an 0 % bzw. 100 % als der Marktpreis (nur wenn beide sich unterscheiden).",
+        f"Richtung richtig: Wenn das Tool mindestens {SIG_PP:.0f} PP vom Markt abweicht – lag es mit der Richtung (höher/niedriger) richtig?",
+        "Ø Abstand zum Markt: Wie stark weicht das Tool im Schnitt überhaupt vom Markt ab. Nahe 0 = das Tool plappert nur den Marktpreis nach.",
+        "Kopf-an-Kopf ist der fairste Vergleich: gleiche Märkte, gleiche Frage. Aussagekräftig ab etwa 30 aufgelösten Märkten je Tool.",
+    ]:
+        rows.append([t])
+    tab = {"title": "Tool-Vergleich", "header": None, "rows": rows, "bold_rows": bold,
+           "widths": [22, 11, 13, 11, 16, 15, 22, 22, 11, 16], "posneg_cols": [5], "wrap_cols": []}
+    return tab, acc
+
+
+def outcomes_for(ids):
+    markets = et.fetch_markets(ids) if ids else {}
+    out = {}
+    for mid, m in markets.items():
+        o = et.outcome_of(m)
+        if o is not None:
+            out[mid] = o
+    for r in et.read_csv(os.path.join("data", "endgame_results.csv")):
+        if r.get("ergebnis") in ("0", "1"):
+            out.setdefault(r["market_id"], int(r["ergebnis"]))
+    return out, markets
 
 
 # ---------------------------------------------------------------- Telegram
@@ -378,19 +505,20 @@ def main():
     if os.environ.get("GITHUB_ACTIONS") and (not et.TOKEN or not et.CHAT_ID):
         raise SystemExit("TELEGRAM_BOT_TOKEN oder TELEGRAM_CHAT_ID fehlt – Secrets prüfen.")
     now = datetime.now(et.TZ)
-    log, fs_log = et.read_csv(et.LOG_FILE), et.read_csv(FS_FILE)
-    trades, skipped = collect_trades(log, fs_log, et.read_csv(ENDGAME_FILE))
-    if not trades:
-        et.send(f"🏆 <b>Trading Competition</b>\nNoch keine Trades – kein Signal hatte bisher eine Edge "
-                f"≥ {MIN_EDGE:.0f} ¢ nach Einstiegspreis (verworfen: "
-                + ", ".join(f"{k} {v}" for k, v in skipped.items()) + ").")
-        return
-    markets = et.fetch_markets({t["market_id"] for t in trades})
+    log, fs_log, eg_log = et.read_csv(et.LOG_FILE), et.read_csv(FS_FILE), et.read_csv(ENDGAME_FILE)
+    trades, skipped = collect_trades(log, fs_log, eg_log)
+
+    # Treffsicherheit aller Prognosen (auch ohne Trade)
+    fc = collect_forecasts(log, fs_log, eg_log)
+    outcomes, markets = outcomes_for({f["market_id"] for f in fc} | {t["market_id"] for t in trades})
+    cmp_tab, acc = comparison_tab(fc, outcomes, fs_log, now)
+
     snaps_by = snapshot_index(et.read_csv(et.SNAP_FILE))
     evaluate(trades, markets, snaps_by)
     board = leaderboard(trades, skipped)
     _, curve_rows = equity_curve(trades, snaps_by, now.strftime("%Y-%m-%d"))
     tabs, chart_row, _ = build_tables(trades, board, curve_rows, now)
+    tabs.insert(1, cmp_tab)
 
     url = ""
     if gsheet.enabled():
@@ -403,8 +531,21 @@ def main():
     if not url:
         et.send_document(f"competition_{now:%Y-%m-%d}.xlsx", et.build_excel(tabs),
                          "🏆 Trading Competition – in Excel öffnen")
-    et.send(telegram_text(board, trades, now, url))
-    print(f"{len(trades)} Trades, Rangliste: " + ", ".join(f"{b['tool']} {b['gesamt']:+.2f}" for b in board))
+    text = telegram_text(board, trades, now, url) if trades else (
+        f"🏆 <b>Trading Competition – {now:%d.%m.%Y}</b>\nNoch keine Trades – kein Signal hatte bisher eine Edge "
+        f"≥ {MIN_EDGE:.0f} ¢ nach Einstiegspreis (verworfen: "
+        + ", ".join(f"{k} {v}" for k, v in skipped.items() if v) + ")."
+        + (f'\n\n📄 <a href="{url}">Google Sheet öffnen</a>' if url else ""))
+    ranked = sorted((r for r in acc if r["aufgeloest"]), key=lambda r: -(r["vorsprung"] or 0))
+    if ranked:
+        text += "\n\n🎯 <b>Treffsicherheit</b> (Brier, kleiner = besser; Vorsprung vor Markt):\n" + "\n".join(
+            f"• {escape(r['tool'])}: {r['brier']:.3f} vs. Markt {r['brier_markt']:.3f} "
+            f"({r['vorsprung']:+.3f}, {r['aufgeloest']} aufgelöst)" for r in ranked)
+    else:
+        n = len({f["market_id"] for f in fc})
+        text += f"\n\n🎯 Tool-Vergleich: {len(fc)} Prognosen zu {n} Märkten gesammelt, noch keiner aufgelöst."
+    et.send(text)
+    print(f"{len(trades)} Trades, {len(fc)} Prognosen, {len(outcomes)} aufgelöste Märkte")
 
 
 if __name__ == "__main__":
