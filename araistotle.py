@@ -12,7 +12,7 @@ Neue Analysen laufen asynchron - wir fragen nach ARAISTOTLE_WAIT Sekunden erneut
 Secret:   FACTICITY_API_KEY
 Variablen (optional):
   ARAISTOTLE_MAX_PER_RUN   max. Maerkte pro Lauf (Standard 20)
-  ARAISTOTLE_WAIT          max. Wartezeit auf neue Analysen in Sekunden (Standard 900 = 15 min)
+  ARAISTOTLE_WAIT          max. Wartezeit auf neue Analysen in Sekunden (Standard 600 = 10 min)
   ARAISTOTLE_LOW_CREDITS   Warnung ab diesem Guthaben (Standard 60)
 
 Test: python araistotle.py <polymarket_market_id>
@@ -36,7 +36,7 @@ def _int(name, default):
 
 
 MAX_PER_RUN = _int("ARAISTOTLE_MAX_PER_RUN", 20)
-WAIT = _int("ARAISTOTLE_WAIT", 900)
+WAIT = _int("ARAISTOTLE_WAIT", 600)
 LOW_CREDITS = _int("ARAISTOTLE_LOW_CREDITS", 60)
 QUEUED = "QUEUED"
 
