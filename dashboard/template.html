@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool vs. Market</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600;700&amp;display=swap">
+<style>
+body{margin:0;background:#0F1419}
+a{color:#5AA9FF}a:hover{color:#8EC5FF}
+h1,h2,h3{font-family:'Space Grotesk',Inter,sans-serif;margin:0}
+.card{background:#182028;border:1px solid #26313C;border-radius:14px;padding:24px;box-sizing:border-box;min-width:0}
+.muted{color:#A3AEB9}
+.pill{background:#1F2933;color:#E6EAEE;border:1px solid #2F3B47;border-radius:999px;padding:10px 16px;font:500 14px Inter,sans-serif;min-height:44px;cursor:pointer}
+.tag{display:inline-block;font-size:12px;font-weight:600;border-radius:6px;padding:3px 8px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;color:#A3AEB9;font-weight:500;padding:8px 10px;border-bottom:1px solid #26313C}
+td{padding:10px;border-bottom:1px solid #222C36}
+.chip{font:500 13px Inter,sans-serif;padding:8px 14px;min-height:40px;border-radius:999px;cursor:pointer;background:transparent;color:#C9D1D9;border:1px solid #33414E}
+.chip[aria-pressed=true]{background:#5AA9FF;color:#0F1419;border-color:#5AA9FF}
+.chip:focus-visible{outline:2px solid #8EC5FF;outline-offset:2px}
+.tab{padding:12px 16px;min-height:44px;font:600 15px Inter,sans-serif;color:#A3AEB9;text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:#E6EAEE}.tab[aria-current=page]{color:#E6EAEE;border-bottom-color:#5AA9FF}
+.tab:focus-visible{outline:2px solid #8EC5FF;outline-offset:2px}
+[hidden]{display:none!important}
+.seg{font:600 14px Inter,sans-serif;padding:10px 18px;min-height:44px;border-radius:10px;cursor:pointer;background:#182028;color:#C9D1D9;border:1px solid #33414E}
+.seg[aria-pressed=true]{background:#5AA9FF;color:#0F1419;border-color:#5AA9FF}
+.seg:focus-visible{outline:2px solid #8EC5FF;outline-offset:2px}
+
+*{box-sizing:border-box}
+@media(max-width:600px){h1{font-size:30px!important}}
+</style>
+
+</head>
+<body>
+
+<div style="font-family:Inter,sans-serif;color:#E6EAEE;background:#0F1419;padding:40px 24px 64px">
+<div style="max-width: 1240px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; position: relative">
+
+<header style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:20px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<div class="muted" style="font-size:13px;letter-spacing:0.08em;text-transform:uppercase">Prediction market case study · @Fluc____</div>
+<h1 style="font-size:40px;font-weight:700">Does any tool beat the market?</h1>
+<div class="muted" style="font-size:15px">Every forecast is compared with the market price at the moment of the check. Data as of <span id="m-asof"></span></div>
+<div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:6px;font-size:14px">
+<span style="background:#1F2933;border:1px solid #2F3B47;border-radius:8px;padding:8px 12px"><span class="muted">First check</span> <b style="font-weight:600" id="m-first"></b></span>
+<span style="background:#1F2933;border:1px solid #2F3B47;border-radius:8px;padding:8px 12px"><span class="muted">Running for</span> <b style="font-weight:600" id="m-days"></b> <span class="muted" id="m-range"></span></span>
+</div>
+<div class="muted" style="font-size:13px" id="m-starts"></div>
+</div>
+
+</header>
+
+<nav aria-label="Pages" style="display:flex;gap:6px;border-bottom:1px solid #26313C">
+<a href="#analysis" class="tab" data-view="analysis">Analysis</a>
+<a href="#competition" class="tab" data-view="competition">Trading competition</a>
+</nav>
+<div id="view-analysis" style="display:flex;flex-direction:column;gap:28px">
+<section class="card" style="display:flex;flex-direction:column;gap:14px" id="overview">
+<h2 style="font-size:20px">Overview per tool</h2>
+<div class="scroll" style="overflow-x:auto"><table id="ov-table" style="min-width:360px">
+<thead><tr><th>Tool</th><th style="text-align:right">Analyses</th><th style="text-align:right">Right direction</th></tr></thead>
+<tbody></tbody></table></div>
+</section>
+
+
+
+<div role="group" aria-label="Market list" style="display:flex;flex-wrap:wrap;gap:8px">
+<button type="button" class="seg" data-list="open" aria-pressed="true">Open markets · where the market is now</button>
+<button type="button" class="seg" data-list="res" aria-pressed="false">Resolved markets · outcome</button>
+</div>
+<section class="card" style="display:flex;flex-direction:column;gap:14px" id="open-markets"><div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;align-items:baseline"><h2 style="font-size:20px">Open markets: where is the market now?</h2><div class="muted" style="font-size:13px" id="open-count"></div></div><div style="display:flex;flex-wrap:wrap;gap:8px" role="group" aria-label="Filter by category" id="open-chips"></div><div style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px"><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#5AA9FF"></span>Exa</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#56D6C9"></span>Exa Pro</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#B48CFF"></span>ArAIstotle</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#FFD27A"></span>FutureSearch</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:3px;height:14px;background:#E6EAEE"></span>Market at check</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:14px;height:14px;border-radius:50%;background:#FF7A59;border:2px solid #0F1419;box-sizing:border-box;box-shadow:0 0 0 2px #FF7A59"></span>Market now</span></div><div class="muted" style="font-size:13px" id="open-summary"></div><div style="overflow-x:auto"><div style="min-width:860px"><div class="muted" style="display:grid;grid-template-columns:300px minmax(300px,1fr) 190px;gap:16px;font-size:12px;padding-bottom:6px;border-bottom:1px solid #26313C"><span>Market · answer</span><span style="display:flex;justify-content:space-between;padding:0 6px"><span>0%</span><span>50%</span><span>100%</span></span><span>Market moved toward</span></div><div id="open-rows"></div></div></div><div class="muted" style="font-size:13px">The orange dot is today’s price. Moving from the white line toward a tool’s dot means the market has since moved in that tool’s direction. Hover or tap a dot for its value.</div></section>
+
+<section class="card" style="display:flex;flex-direction:column;gap:14px" id="res-markets" hidden><div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;align-items:baseline"><h2 style="font-size:20px">All resolved markets: tools vs. market at check</h2><div class="muted" style="font-size:13px" id="res-count"></div></div><div style="display:flex;flex-wrap:wrap;gap:8px" role="group" aria-label="Filter by category" id="res-chips"></div><div style="display:flex;flex-wrap:wrap;gap:18px;font-size:13px"><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#5AA9FF"></span>Exa</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#56D6C9"></span>Exa Pro</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#B48CFF"></span>ArAIstotle</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:50%;background:#FFD27A"></span>FutureSearch</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:3px;height:14px;background:#E6EAEE"></span>Market at check</span><span style="display:inline-flex;align-items:center;gap:6px"><span style="width:8px;height:14px;border-radius:2px;background:#8FE0AE"></span>Outcome (0% or 100%)</span></div><div class="muted" style="font-size:13px" id="res-summary"></div><div style="overflow-x:auto"><div style="min-width:900px"><div class="muted" style="display:grid;grid-template-columns:300px 64px minmax(300px,1fr) 150px;gap:16px;font-size:12px;padding-bottom:6px;border-bottom:1px solid #26313C"><span>Market · answer</span><span>Outcome</span><span style="display:flex;justify-content:space-between;padding:0 6px"><span>0%</span><span>50%</span><span>100%</span></span><span>Closest to outcome</span></div><div id="res-rows"></div></div></div></section>
+</div>
+<div id="view-competition" hidden style="display:flex;flex-direction:column;gap:28px">
+<section class="card" style="display:flex;flex-direction:column;gap:14px" id="competition">
+<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;align-items:baseline"><h2 style="font-size:20px">Paper trading competition</h2><div class="muted" style="font-size:13px">As of <span id="c-asof"></span> · paper money</div></div>
+<div class="muted" style="font-size:14px;line-height:1.6">Each tool “buys” $100 of the side it favours whenever it sees at least 10¢ more value than the real order-book price. It buys only the shares actually available in the order book at that moment, up to 5¢ above the best ask: if there is less than $100 there, it buys only what is available. PnL = what all its trades are worth right now, minus what they cost.</div>
+<div style="overflow-x:auto"><table style="min-width:420px">
+<thead><tr><th>Tool</th><th style="text-align:right">Trades</th><th style="text-align:right">PnL</th><th style="text-align:right">Return</th></tr></thead>
+<tbody id="comp-body"></tbody></table></div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px">
+<div style="background:#1F2933;border-radius:10px;padding:16px">
+<div style="font-weight:600;margin-bottom:2px">How often an analysis became a trade</div>
+<div class="muted" style="font-size:13px;margin-bottom:12px">Trades ÷ analyses · a trade needs at least 10¢ edge</div>
+<div id="rate-bars" style="display:flex;flex-direction:column;gap:10px;font-size:13px"></div></div>
+<div style="background:#1F2933;border-radius:10px;padding:16px;font-size:14px;line-height:1.6">
+<div style="font-weight:600;margin-bottom:6px">How the four tools compare</div>
+<ul style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px" class="muted">
+<li id="c-leader"></li>
+<li><b style="color:#B48CFF;font-weight:600">ArAIstotle</b> stays close to the market price, so it rarely reaches 10¢ edge: 2 trades, both lost.</li>
+<li><b style="color:#FFD27A;font-weight:600">FutureSearch</b> only checks 2 markets a day, so it has few trades (3).</li>
+<li>Most trades bet against the favourite: market at 85–95%, tool at 40–60%, so the tool buys cheap “No”. So far the market was usually right.</li>
+<li>Still early: too few trades per tool for a verdict.</li>
+</ul></div>
+</div>
+<div style="background:#1F2933;border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;align-items:baseline"><div style="font-weight:600">Who forecasts better than the market? (Brier score)</div><div class="muted" style="font-size:13px">Resolved markets only · shorter bar = better</div></div>
+<div id="brier-bars" style="display:flex;flex-direction:column;gap:14px"></div>
+<div class="muted" style="font-size:13px;line-height:1.6">The Brier score measures how far a forecast was from the final result: (forecast − outcome)², with Yes = 1 and No = 0, averaged over all resolved markets. 0 is perfect, 0.25 is what always saying 50% would score. Each tool (coloured bar) is compared with the market price at the same check (grey bar), on the same markets. Tool bar shorter than the grey one = the tool beat the market. Only meaningful once enough markets have resolved, so it complements the PnL rather than replacing it.</div>
+</div>
+</section>
+</div>
+
+</div>
+</div>
+
+<script>
+{
+const D = __DATA__;
+const C = __COMP__;
+const META = __META__;
+const COL = { 'Exa': '#5AA9FF', 'Exa Pro': '#56D6C9', 'ArAIstotle': '#B48CFF', 'FutureSearch': '#FFD27A' };
+const ROW = { 'Exa': 1, 'Exa Pro': 9, 'ArAIstotle': 17, 'FutureSearch': 25 };
+const CATS = ['All', 'Politics', 'Tech & business', 'Pop culture', 'Esports', 'Economy', 'Other'];
+const G1 = 'grid-template-columns:300px minmax(300px,1fr) 190px', G2 = 'grid-template-columns:300px 64px minmax(300px,1fr) 150px';
+const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (x) => String(Math.round(x * 10) / 10);
+const state = { open: 'All', res: 'All' };
+try { const h = location.hash.slice(1); } catch (e) {}
+const dots = (x) => x.tools.map(([t, p]) => `<div title="${esc(t + ' ' + fmt(p) + '%')}" style="position:absolute;left:${p}%;top:${ROW[t]}px;width:10px;height:10px;margin-left:-5px;border-radius:50%;background:${COL[t]}"></div>`).join('');
+const check = (x) => `<div title="Market at check ${fmt(x.check)}%" style="position:absolute;left:${x.check}%;top:-4px;width:3px;height:44px;margin-left:-1px;background:#E6EAEE"></div>`;
+const sub = (x, extra) => esc([x.ans + ' · ' + extra].concat(x.tools.map(([t, p]) => t + ' ' + fmt(p))).join(' · '));
+const title = (x, s) => `<div style="min-width:0"><div style="font-size:14px;font-weight:600">${esc(x.title)}</div><div class="muted" style="font-size:12px">${s}</div></div>`;
+function chips(kind, list) {
+  const el = document.getElementById(kind + '-chips');
+  el.innerHTML = CATS.map((c) => [c, c === 'All' ? list.length : list.filter((x) => x.cat === c).length]).filter(([, n]) => n > 0)
+    .map(([c, n]) => `<button type="button" class="chip" data-cat="${esc(c)}" aria-pressed="${c === state[kind]}">${esc(c)} · ${n}</button>`).join('');
+  el.onclick = (e) => { const b = e.target.closest('button'); if (!b) return; state[kind] = b.dataset.cat; render(); };
+}
+function renderOpen() {
+  const list = D.open.filter((x) => state.open === 'All' || x.cat === state.open), tally = {};
+  const rows = list.map((x) => {
+    const moved = Math.abs(x.now - x.check) >= 0.5;
+    const tow = x.tools.filter(([, p]) => Math.abs(x.now - p) < Math.abs(x.check - p) - 0.01).map(([t]) => t);
+    x.tools.forEach(([t]) => { tally[t] = tally[t] || [0, 0]; if (moved) { tally[t][1]++; if (tow.includes(t)) tally[t][0]++; } });
+    const [lab, col] = !moved ? ['unchanged', '#8A96A3'] : tow.length ? [tow.join(', '), '#8FE0AE'] : ['away from all tools', '#FFB36B'];
+    return `<div style="display:grid;${G1};gap:16px;align-items:center;padding:10px 0;border-bottom:1px solid #222C36">${title(x, sub(x, 'check ' + fmt(x.check) + ' → now ' + fmt(x.now)))}
+<div style="position:relative;height:36px;background:#1F2933;border-radius:6px;margin:0 6px">${check(x)}${dots(x)}<div title="Market now ${fmt(x.now)}%" style="position:absolute;left:${x.now}%;top:9px;width:18px;height:18px;margin-left:-9px;border-radius:50%;background:#FF7A59;border:3px solid #0F1419;box-sizing:border-box;box-shadow:0 0 0 2px #FF7A59"></div></div>
+<div style="font-size:13px;font-weight:600;color:${col}">${esc(lab)}</div></div>`;
+  });
+  document.getElementById('open-rows').innerHTML = rows.join('') || '<div class="muted" style="padding:16px 0">No open markets in this category.</div>';
+  document.getElementById('open-count').textContent = list.length + ' open markets · from the “Prognosen” sheet, ' + META.asofShort + '';
+  document.getElementById('open-summary').textContent = 'Market moved toward the tool since the check: ' + (Object.keys(COL).filter((t) => tally[t] && tally[t][1]).map((t) => t + ' ' + tally[t][0] + ' of ' + tally[t][1]).join(' · ') || '–');
+  chips('open', D.open);
+}
+function renderRes() {
+  const list = D.res.filter((x) => state.res === 'All' || x.cat === state.res), rt = {};
+  const rows = list.map((x) => {
+    const all = [['Market', x.check]].concat(x.tools);
+    const best = Math.min(...all.map(([, p]) => Math.abs(x.out - p)));
+    const win = all.filter(([, p]) => Math.abs(x.out - p) - best < 0.01).map(([t]) => t);
+    x.tools.forEach(([t, p]) => { rt[t] = rt[t] || [0, 0]; rt[t][1]++; if (Math.abs(x.out - p) < Math.abs(x.out - x.check)) rt[t][0]++; });
+    const yes = x.out === 100;
+    return `<div style="display:grid;${G2};gap:16px;align-items:center;padding:10px 0;border-bottom:1px solid #222C36">${title(x, sub(x, 'mkt ' + fmt(x.check)))}
+<div><span class="tag" style="${yes ? 'background:#1C3326;color:#8FE0AE' : 'background:#3A2020;color:#FFB0A8'}">${yes ? 'YES' : 'NO'}</span></div>
+<div style="position:relative;height:36px;background:#1F2933;border-radius:6px;margin:0 6px">${check(x)}${dots(x)}<div style="position:absolute;${yes ? 'right' : 'left'}:-4px;top:-4px;width:8px;height:44px;border-radius:3px;background:${yes ? '#8FE0AE' : '#FFB0A8'}"></div></div>
+<div style="font-size:13px;font-weight:600;color:${win.includes('Market') ? '#E6EAEE' : COL[win[0]]}">${esc(win.join(', '))}</div></div>`;
+  });
+  document.getElementById('res-rows').innerHTML = rows.join('') || '<div class="muted" style="padding:16px 0">No resolved markets in this category.</div>';
+  document.getElementById('res-count').textContent = list.length + ' resolved markets · from the “Prognosen” sheet, ' + META.asofShort + '';
+  document.getElementById('res-summary').textContent = 'Closer to the outcome than the market at check: ' + (Object.keys(COL).filter((t) => rt[t]).map((t) => t + ' ' + rt[t][0] + ' of ' + rt[t][1]).join(' · ') || '–');
+  chips('res', D.res);
+}
+
+function renderOverview() {
+  const st = {};
+  const add = (t) => (st[t] = st[t] || { n: 0, dirOk: 0, dirN: 0, ok: 0, resN: 0, bt: 0, bm: 0 });
+  D.open.forEach((x) => x.tools.forEach(([t, p]) => {
+    const s = add(t); s.n++;
+    const d = p - x.check, mv = x.now - x.check;
+    if (Math.abs(d) >= 0.5 && Math.abs(mv) >= 0.5) { s.dirN++; if (d * mv > 0) s.dirOk++; }
+  }));
+  D.res.forEach((x) => x.tools.forEach(([t, p]) => {
+    const s = add(t); s.n++; s.resN++;
+    const d = p - x.check, mv = x.out - x.check;
+    if (Math.abs(d) >= 0.5 && Math.abs(mv) >= 0.5) { s.dirN++; if (d * mv > 0) s.dirOk++; }
+    if ((p >= 50) === (x.out === 100)) s.ok++;
+    s.bt += ((p - x.out) / 100) ** 2; s.bm += ((x.check - x.out) / 100) ** 2;
+  }));
+  const pct = (a, b) => b ? Math.round(100 * a / b) + '%' : '–';
+  const br = (v, n) => n ? (v / n).toFixed(3) : '–';
+  document.querySelector('#ov-table tbody').innerHTML = Object.keys(COL).filter((t) => st[t]).map((t) => {
+    const s = st[t], better = s.resN && s.bt < s.bm;
+    return `<tr><td style="font-weight:600;color:${COL[t]}">${esc(t)}</td><td style="text-align:right">${s.n}</td>
+<td style="text-align:right">${pct(s.dirOk, s.dirN)} <span class="muted">(${s.dirOk} of ${s.dirN})</span></td></tr>`;
+  }).join('');
+}
+renderOverview();
+
+function renderMeta() {
+  ['m-asof', 'c-asof'].forEach((id) => { document.getElementById(id).textContent = META.asof; });
+  document.getElementById('m-first').textContent = META.first;
+  document.getElementById('m-days').textContent = META.days + ' days';
+  document.getElementById('m-range').textContent = '(' + META.range + ')';
+  document.getElementById('m-starts').textContent = 'Tools started at different times: ' + META.starts;
+}
+function renderComp() {
+  const n = {};
+  D.open.concat(D.res).forEach((x) => x.tools.forEach(([t]) => { n[t] = (n[t] || 0) + 1; }));
+  const money = (v) => (v >= 0 ? '+$' : '−$') + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const rows = C.filter((r) => r.trades > 0).sort((a, b) => b.pnl - a.pnl);
+  document.getElementById('comp-body').innerHTML = rows.map((r) => `<tr><td style="font-weight:600;color:${COL[r.tool] || '#E6EAEE'}">${esc(r.tool)}</td><td style="text-align:right">${r.trades}</td><td style="text-align:right;font-weight:600;color:${r.pnl >= 0 ? '#8FE0AE' : '#FFB36B'}">${money(r.pnl)}</td><td style="text-align:right">${r.ret === null ? '–' : (r.ret > 0 ? '+' : r.ret < 0 ? '−' : '') + Math.abs(r.ret) + '%'}</td></tr>`).join('');
+  document.getElementById('rate-bars').innerHTML = Object.keys(COL).filter((t) => n[t]).map((t) => {
+    const tr = (C.find((r) => r.tool === t) || { trades: 0 }).trades, p = 100 * tr / n[t];
+    return `<div style="display:grid;grid-template-columns:100px minmax(0,1fr) 110px;gap:10px;align-items:center"><span style="color:${COL[t]};font-weight:600">${esc(t)}</span><div style="height:12px;background:#26313C;border-radius:4px"><div style="width:${p.toFixed(1)}%;height:100%;background:${COL[t]};border-radius:4px"></div></div><span style="text-align:right;white-space:nowrap">${tr} of ${n[t]} · ${Math.round(p)}%</span></div>`;
+  }).join('');
+  const lead = rows[0];
+  document.getElementById('c-leader').innerHTML = lead ? `<b style="color:${COL[lead.tool] || '#E6EAEE'};font-weight:600">${esc(lead.tool)}</b> leads right now with ${money(lead.pnl)}. A few big trades can still change the ranking.` : '';
+}
+renderMeta(); renderComp();
+
+document.querySelectorAll('.seg').forEach((b) => b.addEventListener('click', () => {
+  const v = b.dataset.list;
+  document.querySelectorAll('.seg').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+  document.getElementById('open-markets').hidden = v !== 'open';
+  document.getElementById('res-markets').hidden = v !== 'res';
+}));
+
+function renderBrier() {
+  const st = {};
+  D.res.forEach((x) => x.tools.forEach(([t, p]) => { const s = (st[t] = st[t] || { n: 0, bt: 0, bm: 0 }); s.n++; s.bt += ((p - x.out) / 100) ** 2; s.bm += ((x.check - x.out) / 100) ** 2; }));
+  const max = 0.25, w = (v) => Math.min(100, 100 * v / max).toFixed(1);
+  document.getElementById('brier-bars').innerHTML = Object.keys(COL).filter((t) => st[t]).map((t) => {
+    const s = st[t], bt = s.bt / s.n, bm = s.bm / s.n, better = bt < bm, few = s.n < 20;
+    const tag = better ? ['Beats the market', '#1C3326', '#8FE0AE'] : ['Worse than the market', '#3A2A1A', '#FFB36B'];
+    return `<div style="display:grid;grid-template-columns:110px minmax(0,1fr);gap:12px;align-items:center">
+<div><div style="font-weight:600;color:${COL[t]}">${esc(t)}</div><div class="muted" style="font-size:12px">${s.n} resolved</div></div>
+<div style="display:flex;flex-direction:column;gap:5px">
+<div style="display:grid;grid-template-columns:minmax(0,1fr) 120px;gap:10px;align-items:center;font-size:13px"><div style="height:12px;background:#26313C;border-radius:4px"><div style="width:${w(bt)}%;height:100%;background:${COL[t]};border-radius:4px"></div></div><span style="white-space:nowrap">Tool <b style="font-weight:600">${bt.toFixed(3)}</b></span></div>
+<div style="display:grid;grid-template-columns:minmax(0,1fr) 120px;gap:10px;align-items:center;font-size:13px"><div style="height:12px;background:#26313C;border-radius:4px"><div style="width:${w(bm)}%;height:100%;background:#7D8A97;border-radius:4px"></div></div><span class="muted" style="white-space:nowrap">Market ${bm.toFixed(3)}</span></div>
+<div><span class="tag" style="background:${tag[1]};color:${tag[2]}">${tag[0]}</span>${few ? ' <span class="muted" style="font-size:12px">· too few markets to trust yet</span>' : ''}</div>
+</div></div>`;
+  }).join('');
+}
+renderBrier();
+
+function showView() {
+  let v = 'analysis';
+  try { if (location.hash === '#competition') v = 'competition'; } catch (e) {}
+  document.getElementById('view-analysis').hidden = v !== 'analysis';
+  document.getElementById('view-competition').hidden = v !== 'competition';
+  document.querySelectorAll('.tab').forEach((t) => { if (t.dataset.view === v) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current'); });
+}
+window.addEventListener('hashchange', showView);
+showView();
+function render() { renderOpen(); renderRes(); }
+render();
+}
+</script>
+</body>
+</html>
