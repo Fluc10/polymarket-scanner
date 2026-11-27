@@ -74,7 +74,9 @@ TOPIC_RE = re.compile(r"#\s*(tweets|posts)|truth social posts|\btweets? (from|be
 
 MARKET_FIELDS = ["erfasst_am", "market_id", "event", "event_slug", "frage", "antwort", "enddatum",
                  "volumen", "kategorie", "erster_preis"]
-PRICE_FIELDS = ["datum", "market_id", "tage_bis_ende", "ja_prozent", "uma_status"]
+PRICE_FIELDS = ["datum", "market_id", "tage_bis_ende", "ja_prozent", "uma_status",
+                # ab 27.11.2026: echte Handelspreise fuer Backtests (Ja-Seite, in Prozent/Cent)
+                "ja_bid", "ja_ask", "spread_ct", "liquiditaet", "volumen_24h"]
 RESULT_FIELDS = ["market_id", "ergebnis", "erkannt_am"]
 BOOK_KEYS = ["ja_bid", "ja_ask", "nein_bid", "nein_ask", "einstieg_ja", "gefuellt_ja",
              "einstieg_nein", "gefuellt_nein"]
@@ -731,8 +733,15 @@ def main():
         p, d = yes_price(m), days_left(m, now)
         if p is None or d is None or (today, mid) in have or m.get("closed"):
             continue
+        bid, ask = num_field(m, "bestBid"), num_field(m, "bestAsk")
+        liq, v24 = num_field(m, "liquidityNum", "liquidity"), num_field(m, "volume24hr", "volume24hrClob")
         new_prices.append({"datum": today, "market_id": mid, "tage_bis_ende": round(d, 2),
-                           "ja_prozent": round(p * 100, 1), "uma_status": m.get("umaResolutionStatus") or ""})
+                           "ja_prozent": round(p * 100, 1), "uma_status": m.get("umaResolutionStatus") or "",
+                           "ja_bid": "" if bid is None else round(bid * 100, 1),
+                           "ja_ask": "" if ask is None else round(ask * 100, 1),
+                           "spread_ct": "" if bid is None or ask is None else round((ask - bid) * 100, 1),
+                           "liquiditaet": "" if liq is None else round(liq),
+                           "volumen_24h": "" if v24 is None else round(v24)})
     if new_prices:
         orderbook.csv_append(PRICES_FILE, PRICE_FIELDS, new_prices)
     if new_results:
